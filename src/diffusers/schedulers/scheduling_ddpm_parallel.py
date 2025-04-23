@@ -70,25 +70,28 @@ def betas_for_alpha_bar(
     Returns:
         betas (`np.ndarray`): the betas used by the scheduler to step the model outputs
     """
+    # Use numpy vectorization for fast computation
+    steps = np.arange(num_diffusion_timesteps + 1, dtype=np.float64) / num_diffusion_timesteps
+
     if alpha_transform_type == "cosine":
-
-        def alpha_bar_fn(t):
-            return math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2
-
+        # Precompute constants
+        offset = 0.008
+        scale = math.pi / 2 / 1.008
+        thetas = (steps + offset) * scale
+        alphas = np.cos(thetas) ** 2
     elif alpha_transform_type == "exp":
-
-        def alpha_bar_fn(t):
-            return math.exp(t * -12.0)
-
+        alphas = np.exp(steps * -12.0)
     else:
         raise ValueError(f"Unsupported alpha_transform_type: {alpha_transform_type}")
 
-    betas = []
-    for i in range(num_diffusion_timesteps):
-        t1 = i / num_diffusion_timesteps
-        t2 = (i + 1) / num_diffusion_timesteps
-        betas.append(min(1 - alpha_bar_fn(t2) / alpha_bar_fn(t1), max_beta))
-    return torch.tensor(betas, dtype=torch.float32)
+    # Compute betas vectorized
+    # betas[i] = min(1 - alpha(t2)/alpha(t1), max_beta)
+    alpha_t1 = alphas[:-1]
+    alpha_t2 = alphas[1:]
+    betas = 1.0 - (alpha_t2 / alpha_t1)
+    betas = np.minimum(betas, max_beta)
+    
+    return torch.from_numpy(betas.astype(np.float32))
 
 
 # Copied from diffusers.schedulers.scheduling_ddim.rescale_zero_terminal_snr
