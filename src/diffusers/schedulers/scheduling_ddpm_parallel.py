@@ -44,6 +44,9 @@ class DDPMParallelSchedulerOutput(BaseOutput):
 
     prev_sample: torch.Tensor
     pred_original_sample: Optional[torch.Tensor] = None
+    def __init__(self, prev_sample, pred_original_sample):
+        self.prev_sample = prev_sample
+        self.pred_original_sample = pred_original_sample
 
 
 # Copied from diffusers.schedulers.scheduling_ddpm.betas_for_alpha_bar
@@ -185,7 +188,6 @@ class DDPMParallelScheduler(SchedulerMixin, ConfigMixin):
     _is_ode_scheduler = False
 
     @register_to_config
-    # Copied from diffusers.schedulers.scheduling_ddpm.DDPMScheduler.__init__
     def __init__(
         self,
         num_train_timesteps: int = 1000,
@@ -209,19 +211,15 @@ class DDPMParallelScheduler(SchedulerMixin, ConfigMixin):
         elif beta_schedule == "linear":
             self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
         elif beta_schedule == "scaled_linear":
-            # this schedule is very specific to the latent diffusion model.
             self.betas = torch.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=torch.float32) ** 2
         elif beta_schedule == "squaredcos_cap_v2":
-            # Glide cosine schedule
             self.betas = betas_for_alpha_bar(num_train_timesteps)
         elif beta_schedule == "sigmoid":
-            # GeoDiff sigmoid schedule
             betas = torch.linspace(-6, 6, num_train_timesteps)
             self.betas = torch.sigmoid(betas) * (beta_end - beta_start) + beta_start
         else:
             raise NotImplementedError(f"{beta_schedule} is not implemented for {self.__class__}")
 
-        # Rescale for zero SNR
         if rescale_betas_zero_snr:
             self.betas = rescale_zero_terminal_snr(self.betas)
 
@@ -229,10 +227,8 @@ class DDPMParallelScheduler(SchedulerMixin, ConfigMixin):
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
         self.one = torch.tensor(1.0)
 
-        # standard deviation of the initial noise distribution
         self.init_noise_sigma = 1.0
 
-        # setable values
         self.custom_timesteps = False
         self.num_inference_steps = None
         self.timesteps = torch.from_numpy(np.arange(0, num_train_timesteps)[::-1].copy())
@@ -335,33 +331,22 @@ class DDPMParallelScheduler(SchedulerMixin, ConfigMixin):
     # Copied from diffusers.schedulers.scheduling_ddpm.DDPMScheduler._get_variance
     def _get_variance(self, t, predicted_variance=None, variance_type=None):
         prev_t = self.previous_timestep(t)
-
         alpha_prod_t = self.alphas_cumprod[t]
         alpha_prod_t_prev = self.alphas_cumprod[prev_t] if prev_t >= 0 else self.one
         current_beta_t = 1 - alpha_prod_t / alpha_prod_t_prev
 
-        # For t > 0, compute predicted variance βt (see formula (6) and (7) from https://arxiv.org/pdf/2006.11239.pdf)
-        # and sample from it to get previous sample
-        # x_{t-1} ~ N(pred_prev_sample, variance) == add variance to pred_sample
         variance = (1 - alpha_prod_t_prev) / (1 - alpha_prod_t) * current_beta_t
-
-        # we always take the log of variance, so clamp it to ensure it's not 0
         variance = torch.clamp(variance, min=1e-20)
+        
+        variance_type = variance_type or self.config.variance_type
 
-        if variance_type is None:
-            variance_type = self.config.variance_type
-
-        # hacks - were probably added for training stability
         if variance_type == "fixed_small":
-            variance = variance
-        # for rl-diffuser https://arxiv.org/abs/2205.09991
+            pass
         elif variance_type == "fixed_small_log":
-            variance = torch.log(variance)
-            variance = torch.exp(0.5 * variance)
+            variance = torch.exp(0.5 * torch.log(variance))
         elif variance_type == "fixed_large":
             variance = current_beta_t
         elif variance_type == "fixed_large_log":
-            # Glide max_log
             variance = torch.log(current_beta_t)
         elif variance_type == "learned":
             return predicted_variance
@@ -388,22 +373,16 @@ class DDPMParallelScheduler(SchedulerMixin, ConfigMixin):
         batch_size, channels, *remaining_dims = sample.shape
 
         if dtype not in (torch.float32, torch.float64):
-            sample = sample.float()  # upcast for quantile calculation, and clamp not implemented for cpu half
+            sample = sample.float()
 
-        # Flatten sample for doing quantile calculation along each image
-        sample = sample.reshape(batch_size, channels * np.prod(remaining_dims))
+        sample = sample.view(batch_size, channels * np.prod(remaining_dims))
+        abs_sample = sample.abs()
+        
+        s = torch.quantile(abs_sample, self.config.dynamic_thresholding_ratio, dim=1, keepdim=True).clamp(
+            min=1, max=self.config.sample_max_value)
 
-        abs_sample = sample.abs()  # "a certain percentile absolute pixel value"
-
-        s = torch.quantile(abs_sample, self.config.dynamic_thresholding_ratio, dim=1)
-        s = torch.clamp(
-            s, min=1, max=self.config.sample_max_value
-        )  # When clamped to min=1, equivalent to standard clipping to [-1, 1]
-        s = s.unsqueeze(1)  # (batch_size, 1) because clamp will broadcast along dim=0
-        sample = torch.clamp(sample, -s, s) / s  # "we threshold xt0 to the range [-s, s] and then divide by s"
-
-        sample = sample.reshape(batch_size, channels, *remaining_dims)
-        sample = sample.to(dtype)
+        sample = (sample / s).clamp(-1, 1)
+        sample = sample.view(batch_size, channels, *remaining_dims).to(dtype)
 
         return sample
 
@@ -434,7 +413,6 @@ class DDPMParallelScheduler(SchedulerMixin, ConfigMixin):
 
         """
         t = timestep
-
         prev_t = self.previous_timestep(t)
 
         if model_output.shape[1] == sample.shape[1] * 2 and self.variance_type in ["learned", "learned_range"]:
@@ -442,7 +420,6 @@ class DDPMParallelScheduler(SchedulerMixin, ConfigMixin):
         else:
             predicted_variance = None
 
-        # 1. compute alphas, betas
         alpha_prod_t = self.alphas_cumprod[t]
         alpha_prod_t_prev = self.alphas_cumprod[prev_t] if prev_t >= 0 else self.one
         beta_prod_t = 1 - alpha_prod_t
@@ -450,8 +427,6 @@ class DDPMParallelScheduler(SchedulerMixin, ConfigMixin):
         current_alpha_t = alpha_prod_t / alpha_prod_t_prev
         current_beta_t = 1 - current_alpha_t
 
-        # 2. compute predicted original sample from predicted noise also called
-        # "predicted x_0" of formula (15) from https://arxiv.org/pdf/2006.11239.pdf
         if self.config.prediction_type == "epsilon":
             pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
         elif self.config.prediction_type == "sample":
@@ -459,50 +434,33 @@ class DDPMParallelScheduler(SchedulerMixin, ConfigMixin):
         elif self.config.prediction_type == "v_prediction":
             pred_original_sample = (alpha_prod_t**0.5) * sample - (beta_prod_t**0.5) * model_output
         else:
-            raise ValueError(
-                f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample` or"
-                " `v_prediction`  for the DDPMScheduler."
-            )
+            raise ValueError(f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample` or `v_prediction` for the DDPMScheduler.")
 
-        # 3. Clip or threshold "predicted x_0"
         if self.config.thresholding:
             pred_original_sample = self._threshold_sample(pred_original_sample)
         elif self.config.clip_sample:
-            pred_original_sample = pred_original_sample.clamp(
-                -self.config.clip_sample_range, self.config.clip_sample_range
-            )
+            pred_original_sample = pred_original_sample.clamp(-self.config.clip_sample_range, self.config.clip_sample_range)
 
-        # 4. Compute coefficients for pred_original_sample x_0 and current sample x_t
-        # See formula (7) from https://arxiv.org/pdf/2006.11239.pdf
         pred_original_sample_coeff = (alpha_prod_t_prev ** (0.5) * current_beta_t) / beta_prod_t
         current_sample_coeff = current_alpha_t ** (0.5) * beta_prod_t_prev / beta_prod_t
 
-        # 5. Compute predicted previous sample µ_t
-        # See formula (7) from https://arxiv.org/pdf/2006.11239.pdf
         pred_prev_sample = pred_original_sample_coeff * pred_original_sample + current_sample_coeff * sample
 
-        # 6. Add noise
         variance = 0
         if t > 0:
-            device = model_output.device
-            variance_noise = randn_tensor(
-                model_output.shape, generator=generator, device=device, dtype=model_output.dtype
-            )
+            variance_noise = randn_tensor(model_output.shape, generator=generator, device=model_output.device, dtype=model_output.dtype)
+            variance = self._get_variance(t, predicted_variance=predicted_variance)
             if self.variance_type == "fixed_small_log":
-                variance = self._get_variance(t, predicted_variance=predicted_variance) * variance_noise
+                variance = variance * variance_noise
             elif self.variance_type == "learned_range":
-                variance = self._get_variance(t, predicted_variance=predicted_variance)
                 variance = torch.exp(0.5 * variance) * variance_noise
             else:
-                variance = (self._get_variance(t, predicted_variance=predicted_variance) ** 0.5) * variance_noise
+                variance = (variance ** 0.5) * variance_noise
 
         pred_prev_sample = pred_prev_sample + variance
 
         if not return_dict:
-            return (
-                pred_prev_sample,
-                pred_original_sample,
-            )
+            return pred_prev_sample, pred_original_sample
 
         return DDPMParallelSchedulerOutput(prev_sample=pred_prev_sample, pred_original_sample=pred_original_sample)
 
@@ -638,12 +596,9 @@ class DDPMParallelScheduler(SchedulerMixin, ConfigMixin):
 
     # Copied from diffusers.schedulers.scheduling_ddpm.DDPMScheduler.previous_timestep
     def previous_timestep(self, timestep):
-        if self.custom_timesteps or self.num_inference_steps:
+        if self.custom_timesteps or self.num_inference_steps is not None:
             index = (self.timesteps == timestep).nonzero(as_tuple=True)[0][0]
-            if index == self.timesteps.shape[0] - 1:
-                prev_t = torch.tensor(-1)
-            else:
-                prev_t = self.timesteps[index + 1]
+            prev_t = self.timesteps[index + 1] if index < self.timesteps.shape[0] - 1 else -1
         else:
             prev_t = timestep - 1
         return prev_t
