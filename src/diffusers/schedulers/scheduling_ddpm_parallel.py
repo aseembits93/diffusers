@@ -14,7 +14,6 @@
 
 # DISCLAIMER: This file is strongly influenced by https://github.com/ermongroup/ddim
 
-import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -71,23 +70,18 @@ def betas_for_alpha_bar(
         betas (`np.ndarray`): the betas used by the scheduler to step the model outputs
     """
     if alpha_transform_type == "cosine":
-
         def alpha_bar_fn(t):
-            return math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2
-
+            return np.cos((t + 0.008) / 1.008 * np.pi / 2) ** 2
     elif alpha_transform_type == "exp":
-
         def alpha_bar_fn(t):
-            return math.exp(t * -12.0)
-
+            return np.exp(t * -12.0)
     else:
         raise ValueError(f"Unsupported alpha_transform_type: {alpha_transform_type}")
 
-    betas = []
-    for i in range(num_diffusion_timesteps):
-        t1 = i / num_diffusion_timesteps
-        t2 = (i + 1) / num_diffusion_timesteps
-        betas.append(min(1 - alpha_bar_fn(t2) / alpha_bar_fn(t1), max_beta))
+    t_values = np.arange(num_diffusion_timesteps + 1) / num_diffusion_timesteps
+    alpha_bar_values = alpha_bar_fn(t_values)
+
+    betas = np.minimum(1 - alpha_bar_values[1:] / alpha_bar_values[:-1], max_beta)
     return torch.tensor(betas, dtype=torch.float32)
 
 
