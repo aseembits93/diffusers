@@ -723,15 +723,16 @@ def _gather_parameters_with_no_group_offloading_parent(
     module: torch.nn.Module, modules_with_group_offloading: Set[str]
 ) -> List[torch.nn.Parameter]:
     parameters = []
+    # Optimization: use string walking instead of repeated split/join to minimize allocations.
     for name, parameter in module.named_parameters():
         has_parent_with_group_offloading = False
-        atoms = name.split(".")
-        while len(atoms) > 0:
-            parent_name = ".".join(atoms)
-            if parent_name in modules_with_group_offloading:
+        current_name = name
+        while current_name:
+            if current_name in modules_with_group_offloading:
                 has_parent_with_group_offloading = True
                 break
-            atoms.pop()
+            head, sep, tail = current_name.rpartition(".")
+            current_name = head
         if not has_parent_with_group_offloading:
             parameters.append((name, parameter))
     return parameters
