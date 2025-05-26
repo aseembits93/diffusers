@@ -741,15 +741,21 @@ def _gather_buffers_with_no_group_offloading_parent(
     module: torch.nn.Module, modules_with_group_offloading: Set[str]
 ) -> List[torch.Tensor]:
     buffers = []
+    # Pre-make as frozenset for possibly faster lookup, and to avoid accidental mutation.
+    group_offloading_set = frozenset(modules_with_group_offloading)
     for name, buffer in module.named_buffers():
+        # Fast path: if the name itself is not in group_offloading_set, 
+        # walk up the parent chain in-place using rpartition to avoid repeated .split(".") and .join(".")
+        candidate = name
         has_parent_with_group_offloading = False
-        atoms = name.split(".")
-        while len(atoms) > 0:
-            parent_name = ".".join(atoms)
-            if parent_name in modules_with_group_offloading:
+        while True:
+            if candidate in group_offloading_set:
                 has_parent_with_group_offloading = True
                 break
-            atoms.pop()
+            head, sep, tail = candidate.rpartition('.')
+            if not sep:
+                break
+            candidate = head
         if not has_parent_with_group_offloading:
             buffers.append((name, buffer))
     return buffers
