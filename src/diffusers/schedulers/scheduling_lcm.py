@@ -250,6 +250,9 @@ class LCMScheduler(SchedulerMixin, ConfigMixin):
         self._step_index = None
         self._begin_index = None
 
+        # Optimization: Set sigma_data to constant, do not reassign in frequently-called fast path
+        self.sigma_data = 0.5  # Default: 0.5
+
     # Copied from diffusers.schedulers.scheduling_euler_discrete.EulerDiscreteScheduler.index_for_timestep
     def index_for_timestep(self, timestep, schedule_timesteps=None):
         if schedule_timesteps is None:
@@ -487,11 +490,17 @@ class LCMScheduler(SchedulerMixin, ConfigMixin):
         self._begin_index = None
 
     def get_scalings_for_boundary_condition_discrete(self, timestep):
-        self.sigma_data = 0.5  # Default: 0.5
-        scaled_timestep = timestep * self.config.timestep_scaling
+        # Optimization: use previously set constant, avoid repeated assignment and reduce property lookups
+        sdata2 = 0.25  # 0.5 ** 2, precomputed for speed
+        scaling = self.config.timestep_scaling
 
-        c_skip = self.sigma_data**2 / (scaled_timestep**2 + self.sigma_data**2)
-        c_out = scaled_timestep / (scaled_timestep**2 + self.sigma_data**2) ** 0.5
+        # Use local variables and fused, minimal arithmetic for speed
+        scaled_timestep = timestep * scaling
+        denom = scaled_timestep * scaled_timestep + sdata2
+
+        c_skip = sdata2 / denom
+        c_out = scaled_timestep / denom**0.5
+
         return c_skip, c_out
 
     def step(
