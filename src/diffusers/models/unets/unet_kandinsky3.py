@@ -488,9 +488,14 @@ class Kandinsky3AttentionPooling(nn.Module):
         )
 
     def forward(self, x, context, context_mask=None):
-        context_mask = context_mask.to(dtype=context.dtype)
-        context = self.attention(context.mean(dim=1, keepdim=True), context, context_mask)
-        return x + context.squeeze(1)
+        # Only cast context_mask if needed to save time and memory
+        if context_mask is not None and context_mask.dtype != context.dtype:
+            context_mask = context_mask.to(dtype=context.dtype)
+        # Precompute mean only once, keepdim avoids shape issues
+        context_mean = context.mean(dim=1, keepdim=True)
+        context_attn = self.attention(context_mean, context, context_mask)
+        # Use reshape for a more explicit and generally faster squeeze on axis 1
+        return x + context_attn.reshape(x.shape)
 
 
 class Kandinsky3AttentionBlock(nn.Module):
