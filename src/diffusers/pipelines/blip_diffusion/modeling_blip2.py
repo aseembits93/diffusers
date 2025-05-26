@@ -118,14 +118,33 @@ class Blip2VisionEmbeddings(nn.Module):
         self.position_embedding = nn.Parameter(torch.randn(1, self.num_positions, self.embed_dim))
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        # Fast path: avoid unnecessary .to() and allocations by handling dtype and device upfront,
+        # use in-place ops and fused slicing+addition
         batch_size = pixel_values.shape[0]
         target_dtype = self.patch_embedding.weight.dtype
-        patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))  # shape = [*, width, grid, grid]
+        device = self.patch_embedding.weight.device
+
+        # Avoid .to() on pixel_values if already correct dtype
+        if pixel_values.dtype != target_dtype or pixel_values.device != device:
+            pixel_values = pixel_values.to(dtype=target_dtype, device=device, non_blocking=True)
+
+        patch_embeds = self.patch_embedding(pixel_values)
         patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
 
-        class_embeds = self.class_embedding.expand(batch_size, 1, -1).to(target_dtype)
-        embeddings = torch.cat([class_embeds, patch_embeds], dim=1)
-        embeddings = embeddings + self.position_embedding[:, : embeddings.size(1), :].to(target_dtype)
+        # Expand class embed in new tensor & pre-add to save a .to() call later
+        class_embeds = self.class_embedding.expand(batch_size, 1, -1)
+        if class_embeds.dtype != target_dtype or class_embeds.device != device:
+            class_embeds = class_embeds.to(dtype=target_dtype, device=device)
+
+        # Avoid fallback concatenation, reduce memory allocations
+        embeddings = torch.cat((class_embeds, patch_embeds), dim=1)
+
+        # Slice in-place & match dtype/device
+        pos_embed = self.position_embedding[:, :embeddings.shape[1], :]
+        if pos_embed.dtype != target_dtype or pos_embed.device != device:
+            pos_embed = pos_embed.to(dtype=target_dtype, device=device)
+
+        embeddings = embeddings.add_(pos_embed)
         return embeddings
 
 
