@@ -19,6 +19,7 @@ from typing import List, Optional, Tuple, Union
 
 from . import logging
 from .import_utils import is_torch_available, is_torch_version
+import torch
 
 
 if is_torch_available():
@@ -46,7 +47,7 @@ def randn_tensor(
     passing a list of generators, you can seed each batch size individually. If CPU generators are passed, the tensor
     is always created on the CPU.
     """
-    # device on which tensor is created defaults to device
+    # Optimized: avoid unnecessary repeated device conversions, minimize .to()
     rand_device = device
     batch_size = shape[0]
 
@@ -66,19 +67,22 @@ def randn_tensor(
         elif gen_device_type != device.type and gen_device_type == "cuda":
             raise ValueError(f"Cannot generate a {device} tensor from a generator of type {gen_device_type}.")
 
-    # make sure generator list of length 1 is treated like a non-list
     if isinstance(generator, list) and len(generator) == 1:
         generator = generator[0]
 
     if isinstance(generator, list):
-        shape = (1,) + shape[1:]
+        shape1 = (1,) + tuple(shape[1:])
         latents = [
-            torch.randn(shape, generator=generator[i], device=rand_device, dtype=dtype, layout=layout)
+            torch.randn(shape1, generator=generator[i], device=rand_device, dtype=dtype, layout=layout)
             for i in range(batch_size)
         ]
-        latents = torch.cat(latents, dim=0).to(device)
+        latents = torch.cat(latents, dim=0)
+        if rand_device != device:
+            latents = latents.to(device)
     else:
-        latents = torch.randn(shape, generator=generator, device=rand_device, dtype=dtype, layout=layout).to(device)
+        latents = torch.randn(shape, generator=generator, device=rand_device, dtype=dtype, layout=layout)
+        if rand_device != device:
+            latents = latents.to(device)
 
     return latents
 

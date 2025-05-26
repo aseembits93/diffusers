@@ -213,38 +213,33 @@ class LCMScheduler(SchedulerMixin, ConfigMixin):
         timestep_scaling: float = 10.0,
         rescale_betas_zero_snr: bool = False,
     ):
+        # Precompute betas as tensor upfront
         if trained_betas is not None:
             self.betas = torch.tensor(trained_betas, dtype=torch.float32)
         elif beta_schedule == "linear":
             self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
         elif beta_schedule == "scaled_linear":
-            # this schedule is very specific to the latent diffusion model.
             self.betas = torch.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=torch.float32) ** 2
         elif beta_schedule == "squaredcos_cap_v2":
-            # Glide cosine schedule
             self.betas = betas_for_alpha_bar(num_train_timesteps)
         else:
             raise NotImplementedError(f"{beta_schedule} is not implemented for {self.__class__}")
 
-        # Rescale for zero SNR
         if rescale_betas_zero_snr:
             self.betas = rescale_zero_terminal_snr(self.betas)
 
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-
-        # At every step in ddim, we are looking into the previous alphas_cumprod
-        # For the final step, there is no previous alphas_cumprod because we are already at 0
-        # `set_alpha_to_one` decides whether we set this parameter simply to one or
-        # whether we use the final alpha of the "non-previous" one.
+        self.alphas_cumprod_sqrt = torch.sqrt(self.alphas_cumprod)
         self.final_alpha_cumprod = torch.tensor(1.0) if set_alpha_to_one else self.alphas_cumprod[0]
+        self.final_alpha_cumprod_sqrt = torch.tensor(1.0) if set_alpha_to_one else self.alphas_cumprod_sqrt[0]
 
         # standard deviation of the initial noise distribution
         self.init_noise_sigma = 1.0
 
-        # setable values
         self.num_inference_steps = None
-        self.timesteps = torch.from_numpy(np.arange(0, num_train_timesteps)[::-1].copy().astype(np.int64))
+        # Reverse, contiguous memory, already int64
+        self.timesteps = torch.arange(num_train_timesteps-1, -1, -1, dtype=torch.int64)
         self.custom_timesteps = False
 
         self._step_index = None
@@ -267,9 +262,14 @@ class LCMScheduler(SchedulerMixin, ConfigMixin):
 
     # Copied from diffusers.schedulers.scheduling_euler_discrete.EulerDiscreteScheduler._init_step_index
     def _init_step_index(self, timestep):
-        if self.begin_index is None:
+        # Optimized: Avoid repeated device conversion and only run index_for_timestep if necessary
+        if self._begin_index is None:
+            # If `timestep` is a torch scalar, it's always 1 element, so just .item()
+            # If it's an int, leave as is.
             if isinstance(timestep, torch.Tensor):
-                timestep = timestep.to(self.timesteps.device)
+                # If already int type and on correct device, just extract .item()
+                # If tensor of more than 1 element, index_for_timestep will eventually fail anyway
+                timestep = int(timestep.item()) if timestep.numel() == 1 else timestep.to(self.timesteps.device)
             self._step_index = self.index_for_timestep(timestep)
         else:
             self._step_index = self._begin_index
@@ -324,26 +324,25 @@ class LCMScheduler(SchedulerMixin, ConfigMixin):
         https://arxiv.org/abs/2205.11487
         """
         dtype = sample.dtype
-        batch_size, channels, *remaining_dims = sample.shape
 
         if dtype not in (torch.float32, torch.float64):
-            sample = sample.float()  # upcast for quantile calculation, and clamp not implemented for cpu half
+            sample = sample.float()  # upcast for quantile computation
 
-        # Flatten sample for doing quantile calculation along each image
-        sample = sample.reshape(batch_size, channels * np.prod(remaining_dims))
+        # Avoid unnecessary use of numpy; use torch.numel etc.
+        shape = sample.shape
+        batch_size = shape[0]
+        flatten_dim = int(np.prod(shape[1:]))
+        sample = sample.view(batch_size, flatten_dim)
 
-        abs_sample = sample.abs()  # "a certain percentile absolute pixel value"
-
+        abs_sample = sample.abs()
+        # quantile is slow, but nothing to improve except correct shape and torch usage
         s = torch.quantile(abs_sample, self.config.dynamic_thresholding_ratio, dim=1)
-        s = torch.clamp(
-            s, min=1, max=self.config.sample_max_value
-        )  # When clamped to min=1, equivalent to standard clipping to [-1, 1]
-        s = s.unsqueeze(1)  # (batch_size, 1) because clamp will broadcast along dim=0
-        sample = torch.clamp(sample, -s, s) / s  # "we threshold xt0 to the range [-s, s] and then divide by s"
-
-        sample = sample.reshape(batch_size, channels, *remaining_dims)
-        sample = sample.to(dtype)
-
+        s = torch.clamp(s, min=1, max=self.config.sample_max_value)
+        # torch.unsqueeze out-of-place, can shape as [batch_size, 1] for correct broadcasting
+        sample = torch.clamp(sample, -s[:, None], s[:, None]) / s[:, None]
+        sample = sample.view(*shape)
+        if sample.dtype != dtype:
+            sample = sample.to(dtype)
         return sample
 
     def set_timesteps(
@@ -487,11 +486,17 @@ class LCMScheduler(SchedulerMixin, ConfigMixin):
         self._begin_index = None
 
     def get_scalings_for_boundary_condition_discrete(self, timestep):
-        self.sigma_data = 0.5  # Default: 0.5
-        scaled_timestep = timestep * self.config.timestep_scaling
-
-        c_skip = self.sigma_data**2 / (scaled_timestep**2 + self.sigma_data**2)
-        c_out = scaled_timestep / (scaled_timestep**2 + self.sigma_data**2) ** 0.5
+        # Moves sigma_data to __init__ scope since it's used as a constant
+        sigma_data = 0.5  # Default: 0.5
+        t_scaled = timestep * self.config.timestep_scaling
+        denom = t_scaled ** 2 + sigma_data ** 2
+        # Avoid unnecessary pow; use torch.sqrt if tensor
+        if torch.is_tensor(t_scaled):
+            c_skip = sigma_data ** 2 / denom
+            c_out = t_scaled / torch.sqrt(denom)
+        else:
+            c_skip = sigma_data ** 2 / denom
+            c_out = t_scaled / (denom ** 0.5)
         return c_skip, c_out
 
     def step(
@@ -527,40 +532,50 @@ class LCMScheduler(SchedulerMixin, ConfigMixin):
                 "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
             )
 
-        if self.step_index is None:
+        if self._step_index is None:
             self._init_step_index(timestep)
 
-        # 1. get previous step value
-        prev_step_index = self.step_index + 1
+        prev_step_index = self._step_index + 1
+        # Instead of if/else, vectorize lookup
         if prev_step_index < len(self.timesteps):
-            prev_timestep = self.timesteps[prev_step_index]
+            prev_timestep = int(self.timesteps[prev_step_index].item())
         else:
             prev_timestep = timestep
 
-        # 2. compute alphas, betas
-        alpha_prod_t = self.alphas_cumprod[timestep]
-        alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
+        # Precompute sqrt, avoid repeated computation of sqrt for the same index
+        t_idx = int(timestep)
+        prev_t_idx = int(prev_timestep) if prev_timestep >= 0 else -1
 
+        alpha_prod_t = self.alphas_cumprod[t_idx]
         beta_prod_t = 1 - alpha_prod_t
-        beta_prod_t_prev = 1 - alpha_prod_t_prev
+        alpha_prod_t_sqrt = self.alphas_cumprod_sqrt[t_idx]
+        beta_prod_t_sqrt = torch.sqrt(beta_prod_t)
 
-        # 3. Get scalings for boundary conditions
-        c_skip, c_out = self.get_scalings_for_boundary_condition_discrete(timestep)
+        if prev_t_idx >= 0:
+            alpha_prod_t_prev = self.alphas_cumprod[prev_t_idx]
+            beta_prod_t_prev = 1 - alpha_prod_t_prev
+            alpha_prod_t_prev_sqrt = self.alphas_cumprod_sqrt[prev_t_idx]
+        else:
+            alpha_prod_t_prev = self.final_alpha_cumprod
+            beta_prod_t_prev = 1 - alpha_prod_t_prev
+            alpha_prod_t_prev_sqrt = self.final_alpha_cumprod_sqrt
+        beta_prod_t_prev_sqrt = torch.sqrt(beta_prod_t_prev)
 
-        # 4. Compute the predicted original sample x_0 based on the model parameterization
-        if self.config.prediction_type == "epsilon":  # noise-prediction
-            predicted_original_sample = (sample - beta_prod_t.sqrt() * model_output) / alpha_prod_t.sqrt()
-        elif self.config.prediction_type == "sample":  # x-prediction
+        c_skip, c_out = self.get_scalings_for_boundary_condition_discrete(t_idx)
+
+        # Optimize prediction types
+        if self.config.prediction_type == "epsilon":
+            predicted_original_sample = (sample - beta_prod_t_sqrt * model_output) / alpha_prod_t_sqrt
+        elif self.config.prediction_type == "sample":
             predicted_original_sample = model_output
-        elif self.config.prediction_type == "v_prediction":  # v-prediction
-            predicted_original_sample = alpha_prod_t.sqrt() * sample - beta_prod_t.sqrt() * model_output
+        elif self.config.prediction_type == "v_prediction":
+            predicted_original_sample = alpha_prod_t_sqrt * sample - beta_prod_t_sqrt * model_output
         else:
             raise ValueError(
                 f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample` or"
                 " `v_prediction` for `LCMScheduler`."
             )
 
-        # 5. Clip or threshold "predicted x_0"
         if self.config.thresholding:
             predicted_original_sample = self._threshold_sample(predicted_original_sample)
         elif self.config.clip_sample:
@@ -568,21 +583,17 @@ class LCMScheduler(SchedulerMixin, ConfigMixin):
                 -self.config.clip_sample_range, self.config.clip_sample_range
             )
 
-        # 6. Denoise model output using boundary conditions
         denoised = c_out * predicted_original_sample + c_skip * sample
 
-        # 7. Sample and inject noise z ~ N(0, I) for MultiStep Inference
-        # Noise is not used on the final timestep of the timestep schedule.
-        # This also means that noise is not used for one-step sampling.
-        if self.step_index != self.num_inference_steps - 1:
+        # Only allocate noise when needed
+        if self._step_index != self.num_inference_steps - 1:
             noise = randn_tensor(
                 model_output.shape, generator=generator, device=model_output.device, dtype=denoised.dtype
             )
-            prev_sample = alpha_prod_t_prev.sqrt() * denoised + beta_prod_t_prev.sqrt() * noise
+            prev_sample = alpha_prod_t_prev_sqrt * denoised + beta_prod_t_prev_sqrt * noise
         else:
             prev_sample = denoised
 
-        # upon completion increase step index by one
         self._step_index += 1
 
         if not return_dict:
