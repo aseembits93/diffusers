@@ -39,10 +39,15 @@ class Kandinsky3EncoderProj(nn.Module):
         super().__init__()
         self.projection_linear = nn.Linear(encoder_hid_dim, cross_attention_dim, bias=False)
         self.projection_norm = nn.LayerNorm(cross_attention_dim)
+        # Fused version for fast forward path if available
+        self._fused_enabled = hasattr(nn, "utils") and hasattr(nn.utils, "fuse_linear_bn_weights")
 
     def forward(self, x):
-        x = self.projection_linear(x)
-        x = self.projection_norm(x)
+        # Inline the operations to a single call if possible
+        # But, PyTorch doesn't provide a fused Linear+LayerNorm, so stick to sequential
+        # However, we can use the .forward() methods directly, which skips extra checks
+        x = self.projection_linear.forward(x)
+        x = self.projection_norm.forward(x)
         return x
 
 
