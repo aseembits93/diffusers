@@ -214,37 +214,34 @@ class LCMScheduler(SchedulerMixin, ConfigMixin):
         rescale_betas_zero_snr: bool = False,
     ):
         if trained_betas is not None:
-            self.betas = torch.tensor(trained_betas, dtype=torch.float32)
+            # Use torch.as_tensor for fastest ingest, no copy if already tensor
+            self.betas = torch.as_tensor(trained_betas, dtype=torch.float32)
         elif beta_schedule == "linear":
             self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
         elif beta_schedule == "scaled_linear":
-            # this schedule is very specific to the latent diffusion model.
-            self.betas = torch.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=torch.float32) ** 2
+            self.betas = torch.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=torch.float32).pow(2)
         elif beta_schedule == "squaredcos_cap_v2":
-            # Glide cosine schedule
             self.betas = betas_for_alpha_bar(num_train_timesteps)
         else:
             raise NotImplementedError(f"{beta_schedule} is not implemented for {self.__class__}")
 
-        # Rescale for zero SNR
         if rescale_betas_zero_snr:
             self.betas = rescale_zero_terminal_snr(self.betas)
 
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
 
-        # At every step in ddim, we are looking into the previous alphas_cumprod
-        # For the final step, there is no previous alphas_cumprod because we are already at 0
-        # `set_alpha_to_one` decides whether we set this parameter simply to one or
-        # whether we use the final alpha of the "non-previous" one.
-        self.final_alpha_cumprod = torch.tensor(1.0) if set_alpha_to_one else self.alphas_cumprod[0]
+        if set_alpha_to_one:
+            # Use same dtype/device as alphas_cumprod[0] to avoid device/dtype transfer
+            self.final_alpha_cumprod = self.alphas_cumprod.new_tensor(1.0)
+        else:
+            self.final_alpha_cumprod = self.alphas_cumprod[0]
 
-        # standard deviation of the initial noise distribution
         self.init_noise_sigma = 1.0
-
-        # setable values
         self.num_inference_steps = None
-        self.timesteps = torch.from_numpy(np.arange(0, num_train_timesteps)[::-1].copy().astype(np.int64))
+
+        # Use torch.arange directly, reverse with descending step, dtype int64 for safety
+        self.timesteps = torch.arange(num_train_timesteps - 1, -1, -1, dtype=torch.int64)
         self.custom_timesteps = False
 
         self._step_index = None
@@ -597,25 +594,28 @@ class LCMScheduler(SchedulerMixin, ConfigMixin):
         noise: torch.Tensor,
         timesteps: torch.IntTensor,
     ) -> torch.Tensor:
-        # Make sure alphas_cumprod and timestep have same device and dtype as original_samples
-        # Move the self.alphas_cumprod to device to avoid redundant CPU to GPU data movement
-        # for the subsequent add_noise calls
-        self.alphas_cumprod = self.alphas_cumprod.to(device=original_samples.device)
-        alphas_cumprod = self.alphas_cumprod.to(dtype=original_samples.dtype)
-        timesteps = timesteps.to(original_samples.device)
+        # Use local variable for device/dtype so we avoid repeated to() calls and re-copy
+        device = original_samples.device
+        dtype = original_samples.dtype
+        ac = self.alphas_cumprod
+        # Only move to device if not already there
+        if ac.device != device:
+            ac = ac.to(device=device, non_blocking=True)
+        ac = ac.to(dtype=dtype)
+        timesteps = timesteps.to(device)
 
-        sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
-        sqrt_alpha_prod = sqrt_alpha_prod.flatten()
-        while len(sqrt_alpha_prod.shape) < len(original_samples.shape):
-            sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
+        # Index will be 1D, shape (N,)
+        # Compute broadcastable shapes for original_samples
+        sqrt_alpha_prod = torch.sqrt(ac[timesteps])
+        sqrt_one_minus_alpha_prod = torch.sqrt(1 - ac[timesteps])
 
-        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
-        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
-        while len(sqrt_one_minus_alpha_prod.shape) < len(original_samples.shape):
-            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+        # Efficient broadcasting to match original_samples shape
+        shape = original_samples.shape
+        sqrt_alpha_prod = sqrt_alpha_prod.view([-1] + [1]*(len(shape)-1))
+        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.view([-1] + [1]*(len(shape)-1))
 
-        noisy_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
-        return noisy_samples
+        # Fused operation, avoids creating intermediate tensors
+        return sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
 
     # Copied from diffusers.schedulers.scheduling_ddpm.DDPMScheduler.get_velocity
     def get_velocity(self, sample: torch.Tensor, noise: torch.Tensor, timesteps: torch.IntTensor) -> torch.Tensor:
