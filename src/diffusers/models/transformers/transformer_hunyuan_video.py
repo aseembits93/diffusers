@@ -231,7 +231,6 @@ class HunyuanVideoTokenReplaceAdaLayerNormZero(nn.Module):
 class HunyuanVideoTokenReplaceAdaLayerNormZeroSingle(nn.Module):
     def __init__(self, embedding_dim: int, norm_type: str = "layer_norm", bias: bool = True):
         super().__init__()
-
         self.silu = nn.SiLU()
         self.linear = nn.Linear(embedding_dim, 3 * embedding_dim, bias=bias)
 
@@ -249,22 +248,32 @@ class HunyuanVideoTokenReplaceAdaLayerNormZeroSingle(nn.Module):
         token_replace_emb: torch.Tensor,
         first_frame_num_tokens: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        emb = self.linear(self.silu(emb))
-        token_replace_emb = self.linear(self.silu(token_replace_emb))
+        emb_chunk = self._proj_and_chunk(self.linear, self.silu, emb, hidden_states.size(-1))
+        token_replace_emb_chunk = self._proj_and_chunk(self.linear, self.silu, token_replace_emb, hidden_states.size(-1))
 
-        shift_msa, scale_msa, gate_msa = emb.chunk(3, dim=1)
-        tr_shift_msa, tr_scale_msa, tr_gate_msa = token_replace_emb.chunk(3, dim=1)
+        shift_msa, scale_msa, gate_msa = emb_chunk
+        tr_shift_msa, tr_scale_msa, tr_gate_msa = token_replace_emb_chunk
 
         norm_hidden_states = self.norm(hidden_states)
-        hidden_states_zero = (
-            norm_hidden_states[:, :first_frame_num_tokens] * (1 + tr_scale_msa[:, None]) + tr_shift_msa[:, None]
-        )
-        hidden_states_orig = (
-            norm_hidden_states[:, first_frame_num_tokens:] * (1 + scale_msa[:, None]) + shift_msa[:, None]
-        )
+
+        # Use slicing followed by in-place multiplication/addition for efficiency
+        # norm_hidden_states: (B, N, C), scales: (B, C), result: (B, n_tokens, C)
+
+        # zero tokens
+        hidden_states_zero = norm_hidden_states[:, :first_frame_num_tokens].mul_(1 + tr_scale_msa.unsqueeze(1)).add_(tr_shift_msa.unsqueeze(1))
+        # remaining tokens
+        hidden_states_orig = norm_hidden_states[:, first_frame_num_tokens:].mul_(1 + scale_msa.unsqueeze(1)).add_(shift_msa.unsqueeze(1))
+
         hidden_states = torch.cat([hidden_states_zero, hidden_states_orig], dim=1)
 
         return hidden_states, gate_msa, tr_gate_msa
+
+    # Helper to fuse SiLU+Linear and chunk in a single call to reduce redundancy.
+    @staticmethod
+    def _proj_and_chunk(linear: nn.Linear, silu: nn.SiLU, emb: torch.Tensor, embedding_dim: int):
+        # SiLU+Linear, then chunk into 3
+        out = linear(silu(emb))
+        return out.split(embedding_dim, dim=1)
 
 
 class HunyuanVideoConditionEmbedding(nn.Module):
