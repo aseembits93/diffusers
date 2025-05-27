@@ -32,48 +32,50 @@ def swap_scale_shift(weight):
 def _maybe_map_sgm_blocks_to_diffusers(state_dict, unet_config, delimiter="_", block_slice_pos=5):
     # 1. get all state_dict_keys
     all_keys = list(state_dict.keys())
-    sgm_patterns = ["input_blocks", "middle_block", "output_blocks"]
-    not_sgm_patterns = ["down_blocks", "mid_block", "up_blocks"]
+    sgm_patterns = ("input_blocks", "middle_block", "output_blocks")
+    not_sgm_patterns = ("down_blocks", "mid_block", "up_blocks")
 
-    # check if state_dict contains both patterns
-    contains_sgm_patterns = False
-    contains_not_sgm_patterns = False
+    # Fast scan for both SGM and non-SGM keys to determine need for cleanup/mapping
+    contains_sgm_patterns = contains_not_sgm_patterns = False
     for key in all_keys:
-        if any(p in key for p in sgm_patterns):
+        if not contains_sgm_patterns and any(p in key for p in sgm_patterns):
             contains_sgm_patterns = True
-        elif any(p in key for p in not_sgm_patterns):
+            if contains_not_sgm_patterns:
+                break
+        if not contains_not_sgm_patterns and any(p in key for p in not_sgm_patterns):
             contains_not_sgm_patterns = True
+            if contains_sgm_patterns:
+                break
 
-    # if state_dict contains both patterns, remove sgm
-    # we can then return state_dict immediately
+    # If state_dict contains both patterns, remove sgm patterns and return immediately
     if contains_sgm_patterns and contains_not_sgm_patterns:
-        for key in all_keys:
-            if any(p in key for p in sgm_patterns):
-                state_dict.pop(key)
+        keys_to_remove = [key for key in all_keys if any(p in key for p in sgm_patterns)]
+        for key in keys_to_remove:
+            state_dict.pop(key)
         return state_dict
 
-    # 2. check if needs remapping, if not return original dict
-    is_in_sgm_format = False
-    for key in all_keys:
-        if any(p in key for p in sgm_patterns):
-            is_in_sgm_format = True
-            break
-
-    if not is_in_sgm_format:
+    # Check if needs remapping, if not return original dict
+    # (Find first SGM match, else just return)
+    if not contains_sgm_patterns:
         return state_dict
 
-    # 3. Else remap from SGM patterns
+    # 3. Remap from SGM patterns
     new_state_dict = {}
-    inner_block_map = ["resnets", "attentions", "upsamplers"]
+    inner_block_map = ("resnets", "attentions", "upsamplers")
 
-    # Retrieves # of down, mid and up blocks
+    # Retrieve # of down, mid and up blocks in a single scan
     input_block_ids, middle_block_ids, output_block_ids = set(), set(), set()
+    # Pre-allocate text and non-text splits for batch key processing
+    text_layers = []
+    non_text_layers = []
 
     for layer in all_keys:
         if "text" in layer:
-            new_state_dict[layer] = state_dict.pop(layer)
+            text_layers.append(layer)
         else:
-            layer_id = int(layer.split(delimiter)[:block_slice_pos][-1])
+            non_text_layers.append(layer)
+            split = layer.split(delimiter)
+            layer_id = int(split[:block_slice_pos][-1])
             if sgm_patterns[0] in layer:
                 input_block_ids.add(layer_id)
             elif sgm_patterns[1] in layer:
@@ -83,37 +85,54 @@ def _maybe_map_sgm_blocks_to_diffusers(state_dict, unet_config, delimiter="_", b
             else:
                 raise ValueError(f"Checkpoint not supported because layer {layer} not supported.")
 
-    input_blocks = {
-        layer_id: [key for key in state_dict if f"input_blocks{delimiter}{layer_id}" in key]
-        for layer_id in input_block_ids
-    }
-    middle_blocks = {
-        layer_id: [key for key in state_dict if f"middle_block{delimiter}{layer_id}" in key]
-        for layer_id in middle_block_ids
-    }
-    output_blocks = {
-        layer_id: [key for key in state_dict if f"output_blocks{delimiter}{layer_id}" in key]
-        for layer_id in output_block_ids
-    }
+    # Assign text keys directly
+    for text_key in text_layers:
+        new_state_dict[text_key] = state_dict.pop(text_key)
 
-    # Rename keys accordingly
+    # Fast-grouping relevant block keys by id (avoid repeated scans)
+    def group_block_keys(ids, sgm_pat):
+        grouped = {layer_id: [] for layer_id in ids}
+        s = f"{sgm_pat}{delimiter}"
+        sl = len(s)
+        for key in list(state_dict):  # only unprocessed keys
+            idx = key.find(s)
+            if idx != -1:
+                rest = key[idx+sl:]
+                try:
+                    layer_id = int(rest.split(delimiter, 1)[0])
+                except ValueError:
+                    continue
+                if layer_id in grouped:
+                    grouped[layer_id].append(key)
+        return grouped
+
+    input_blocks   = group_block_keys(input_block_ids, "input_blocks")
+    middle_blocks  = group_block_keys(middle_block_ids, "middle_block")
+    output_blocks  = group_block_keys(output_block_ids, "output_blocks")
+    lpblock = unet_config.layers_per_block + 1
+
+    # Rename keys accordingly for inputs
     for i in input_block_ids:
-        block_id = (i - 1) // (unet_config.layers_per_block + 1)
-        layer_in_block_id = (i - 1) % (unet_config.layers_per_block + 1)
-
+        block_id = (i - 1) // lpblock
+        layer_in_block_id = (i - 1) % lpblock
         for key in input_blocks[i]:
-            inner_block_id = int(key.split(delimiter)[block_slice_pos])
-            inner_block_key = inner_block_map[inner_block_id] if "op" not in key else "downsamplers"
-            inner_layers_in_block = str(layer_in_block_id) if "op" not in key else "0"
+            split_key = key.split(delimiter)
+            inner_block_id = int(split_key[block_slice_pos])
+            if "op" not in key:
+                inner_block_key = inner_block_map[inner_block_id]
+                inner_layers_in_block = str(layer_in_block_id)
+            else:
+                inner_block_key = "downsamplers"
+                inner_layers_in_block = "0"
             new_key = delimiter.join(
-                key.split(delimiter)[: block_slice_pos - 1]
+                split_key[:block_slice_pos-1]
                 + [str(block_id), inner_block_key, inner_layers_in_block]
-                + key.split(delimiter)[block_slice_pos + 1 :]
+                + split_key[block_slice_pos+1:]
             )
             new_state_dict[new_key] = state_dict.pop(key)
 
+    # Rename keys accordingly for middle
     for i in middle_block_ids:
-        key_part = None
         if i == 0:
             key_part = [inner_block_map[0], "0"]
         elif i == 1:
@@ -122,25 +141,26 @@ def _maybe_map_sgm_blocks_to_diffusers(state_dict, unet_config, delimiter="_", b
             key_part = [inner_block_map[0], "1"]
         else:
             raise ValueError(f"Invalid middle block id {i}.")
-
         for key in middle_blocks[i]:
+            split_key = key.split(delimiter)
             new_key = delimiter.join(
-                key.split(delimiter)[: block_slice_pos - 1] + key_part + key.split(delimiter)[block_slice_pos:]
+                split_key[:block_slice_pos-1] + key_part + split_key[block_slice_pos:]
             )
             new_state_dict[new_key] = state_dict.pop(key)
 
+    # Rename keys for outputs
     for i in output_block_ids:
-        block_id = i // (unet_config.layers_per_block + 1)
-        layer_in_block_id = i % (unet_config.layers_per_block + 1)
-
+        block_id = i // lpblock
+        layer_in_block_id = i % lpblock
         for key in output_blocks[i]:
-            inner_block_id = int(key.split(delimiter)[block_slice_pos])
+            split_key = key.split(delimiter)
+            inner_block_id = int(split_key[block_slice_pos])
             inner_block_key = inner_block_map[inner_block_id]
             inner_layers_in_block = str(layer_in_block_id) if inner_block_id < 2 else "0"
             new_key = delimiter.join(
-                key.split(delimiter)[: block_slice_pos - 1]
+                split_key[:block_slice_pos-1]
                 + [str(block_id), inner_block_key, inner_layers_in_block]
-                + key.split(delimiter)[block_slice_pos + 1 :]
+                + split_key[block_slice_pos+1:]
             )
             new_state_dict[new_key] = state_dict.pop(key)
 
