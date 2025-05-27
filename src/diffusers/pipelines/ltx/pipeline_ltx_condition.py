@@ -142,6 +142,15 @@ def calculate_shift(
     base_shift: float = 0.5,
     max_shift: float = 1.15,
 ):
+    # Fast path for default arguments
+    if (
+        base_seq_len is _BASE_SEQ_LEN
+        and max_seq_len is _MAX_SEQ_LEN
+        and base_shift is _BASE_SHIFT
+        and max_shift is _MAX_SHIFT
+    ):
+        return image_seq_len * _M_default + _B_default
+    # Slow path for custom parameters
     m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
     b = base_shift - m * base_seq_len
     mu = image_seq_len * m + b
@@ -1192,3 +1201,15 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
             return (video,)
 
         return LTXPipelineOutput(frames=video)
+
+_BASE_SEQ_LEN = 256
+
+_MAX_SEQ_LEN = 4096
+
+_BASE_SHIFT = 0.5
+
+_MAX_SHIFT = 1.15
+
+_M_default = (_MAX_SHIFT - _BASE_SHIFT) / (_MAX_SEQ_LEN - _BASE_SEQ_LEN)
+
+_B_default = _BASE_SHIFT - _M_default * _BASE_SEQ_LEN
