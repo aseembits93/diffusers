@@ -168,34 +168,53 @@ def _convert_non_diffusers_lora_to_diffusers(state_dict, unet_name="unet", text_
     te2_state_dict = {}
     network_alphas = {}
 
-    # Check for DoRA-enabled LoRAs.
-    dora_present_in_unet = any("dora_scale" in k and "lora_unet_" in k for k in state_dict)
-    dora_present_in_te = any("dora_scale" in k and ("lora_te_" in k or "lora_te1_" in k) for k in state_dict)
-    dora_present_in_te2 = any("dora_scale" in k and "lora_te2_" in k for k in state_dict)
+    # Single-pass: Check dora flags efficiently for all keys at once
+    dora_present_in_unet = False
+    dora_present_in_te = False
+    dora_present_in_te2 = False
+
+    for k in state_dict:
+        if not ("dora_scale" in k):
+            continue
+        if "lora_unet_" in k:
+            dora_present_in_unet = True
+            if dora_present_in_te and dora_present_in_te2:  # Early exit
+                break
+        if "lora_te_" in k or "lora_te1_" in k:
+            dora_present_in_te = True
+            if dora_present_in_unet and dora_present_in_te2:
+                break
+        if "lora_te2_" in k:
+            dora_present_in_te2 = True
+            if dora_present_in_unet and dora_present_in_te:
+                break
+
     if dora_present_in_unet or dora_present_in_te or dora_present_in_te2:
         if is_peft_version("<", "0.9.0"):
             raise ValueError(
                 "You need `peft` 0.9.0 at least to use DoRA-enabled LoRAs. Please upgrade your installation of `peft`."
             )
 
-    # Iterate over all LoRA weights.
-    all_lora_keys = list(state_dict.keys())
+    all_lora_keys = tuple(state_dict.keys())  # use tuple to protect against mutation during pop()
+
+    # Pre-compute key->conversion function for startswith
+    unet_starts = "lora_unet_"
+    te_starts = ("lora_te_", "lora_te1_")
+    te2_starts = "lora_te2_"
+
     for key in all_lora_keys:
         if not key.endswith("lora_down.weight"):
             continue
 
-        # Extract LoRA name.
-        lora_name = key.split(".")[0]
+        lora_name = key.split(".", 1)[0]
 
-        # Find corresponding up weight and alpha.
         lora_name_up = lora_name + ".lora_up.weight"
         lora_name_alpha = lora_name + ".alpha"
 
         # Handle U-Net LoRAs.
-        if lora_name.startswith("lora_unet_"):
+        if lora_name.startswith(unet_starts):
             diffusers_name = _convert_unet_lora_key(key)
 
-            # Store down and up weights.
             unet_state_dict[diffusers_name] = state_dict.pop(key)
             unet_state_dict[diffusers_name.replace(".down.", ".up.")] = state_dict.pop(lora_name_up)
 
@@ -207,11 +226,10 @@ def _convert_non_diffusers_lora_to_diffusers(state_dict, unet_name="unet", text_
                 )
 
         # Handle text encoder LoRAs.
-        elif lora_name.startswith(("lora_te_", "lora_te1_", "lora_te2_")):
+        elif lora_name.startswith(te_starts) or lora_name.startswith(te2_starts):
             diffusers_name = _convert_text_encoder_lora_key(key, lora_name)
 
-            # Store down and up weights for te or te2.
-            if lora_name.startswith(("lora_te_", "lora_te1_")):
+            if lora_name.startswith(te_starts):
                 te_state_dict[diffusers_name] = state_dict.pop(key)
                 te_state_dict[diffusers_name.replace(".down.", ".up.")] = state_dict.pop(lora_name_up)
             else:
@@ -223,38 +241,31 @@ def _convert_non_diffusers_lora_to_diffusers(state_dict, unet_name="unet", text_
                 dora_scale_key_to_replace_te = (
                     "_lora.down." if "_lora.down." in diffusers_name else ".lora_linear_layer."
                 )
-                if lora_name.startswith(("lora_te_", "lora_te1_")):
-                    te_state_dict[diffusers_name.replace(dora_scale_key_to_replace_te, ".lora_magnitude_vector.")] = (
-                        state_dict.pop(key.replace("lora_down.weight", "dora_scale"))
-                    )
-                elif lora_name.startswith("lora_te2_"):
-                    te2_state_dict[diffusers_name.replace(dora_scale_key_to_replace_te, ".lora_magnitude_vector.")] = (
-                        state_dict.pop(key.replace("lora_down.weight", "dora_scale"))
-                    )
+                do_scale = state_dict.pop(key.replace("lora_down.weight", "dora_scale"))
+                if lora_name.startswith(te_starts):
+                    te_state_dict[diffusers_name.replace(dora_scale_key_to_replace_te, ".lora_magnitude_vector.")] = do_scale
+                else:
+                    te2_state_dict[diffusers_name.replace(dora_scale_key_to_replace_te, ".lora_magnitude_vector.")] = do_scale
 
-        # Store alpha if present.
         if lora_name_alpha in state_dict:
             alpha = state_dict.pop(lora_name_alpha).item()
             network_alphas.update(_get_alpha_name(lora_name_alpha, diffusers_name, alpha))
 
     # Check if any keys remain.
-    if len(state_dict) > 0:
+    if state_dict:
         raise ValueError(f"The following keys have not been correctly renamed: \n\n {', '.join(state_dict.keys())}")
 
     logger.info("Non-diffusers checkpoint detected.")
 
-    # Construct final state dict.
-    unet_state_dict = {f"{unet_name}.{module_name}": params for module_name, params in unet_state_dict.items()}
-    te_state_dict = {f"{text_encoder_name}.{module_name}": params for module_name, params in te_state_dict.items()}
-    te2_state_dict = (
-        {f"text_encoder_2.{module_name}": params for module_name, params in te2_state_dict.items()}
-        if len(te2_state_dict) > 0
-        else None
-    )
-    if te2_state_dict is not None:
-        te_state_dict.update(te2_state_dict)
+    # Compose state dicts efficiently
+    out_unet = {f"{unet_name}.{k}": v for k, v in unet_state_dict.items()}
+    out_te = {f"{text_encoder_name}.{k}": v for k, v in te_state_dict.items()}
 
-    new_state_dict = {**unet_state_dict, **te_state_dict}
+    if te2_state_dict:
+        out_te2 = {f"text_encoder_2.{k}": v for k, v in te2_state_dict.items()}
+        out_te.update(out_te2)
+
+    new_state_dict = {**out_unet, **out_te}
     return new_state_dict, network_alphas
 
 
@@ -262,28 +273,34 @@ def _convert_unet_lora_key(key):
     """
     Converts a U-Net LoRA key to a Diffusers compatible key.
     """
-    diffusers_name = key.replace("lora_unet_", "").replace("_", ".")
+    # Combine replace calls into a single regex where possible for speed.
+    # Fastest is to do multi-replace on long patterns, then fall back to uniques:
 
-    # Replace common U-Net naming patterns.
-    diffusers_name = diffusers_name.replace("input.blocks", "down_blocks")
-    diffusers_name = diffusers_name.replace("down.blocks", "down_blocks")
-    diffusers_name = diffusers_name.replace("middle.block", "mid_block")
-    diffusers_name = diffusers_name.replace("mid.block", "mid_block")
-    diffusers_name = diffusers_name.replace("output.blocks", "up_blocks")
-    diffusers_name = diffusers_name.replace("up.blocks", "up_blocks")
-    diffusers_name = diffusers_name.replace("transformer.blocks", "transformer_blocks")
-    diffusers_name = diffusers_name.replace("to.q.lora", "to_q_lora")
-    diffusers_name = diffusers_name.replace("to.k.lora", "to_k_lora")
-    diffusers_name = diffusers_name.replace("to.v.lora", "to_v_lora")
-    diffusers_name = diffusers_name.replace("to.out.0.lora", "to_out_lora")
-    diffusers_name = diffusers_name.replace("proj.in", "proj_in")
-    diffusers_name = diffusers_name.replace("proj.out", "proj_out")
-    diffusers_name = diffusers_name.replace("emb.layers", "time_emb_proj")
+    rep = [
+        ("lora_unet_", ""),
+        ("input.blocks", "down_blocks"),
+        ("down.blocks", "down_blocks"),
+        ("middle.block", "mid_block"),
+        ("mid.block", "mid_block"),
+        ("output.blocks", "up_blocks"),
+        ("up.blocks", "up_blocks"),
+        ("transformer.blocks", "transformer_blocks"),
+        ("to.q.lora", "to_q_lora"),
+        ("to.k.lora", "to_k_lora"),
+        ("to.v.lora", "to_v_lora"),
+        ("to.out.0.lora", "to_out_lora"),
+        ("proj.in", "proj_in"),
+        ("proj.out", "proj_out"),
+        ("emb.layers", "time_emb_proj"),
+    ]
+    diffusers_name = key
+    for s, r in rep:
+        diffusers_name = diffusers_name.replace(s, r)
+    diffusers_name = diffusers_name.replace("_", ".")
 
-    # SDXL specific conversions.
+    # SDXL specific conversions; keep as-is for logic clarity and performance
     if "emb" in diffusers_name and "time.emb.proj" not in diffusers_name:
-        pattern = r"\.\d+(?=\D*$)"
-        diffusers_name = re.sub(pattern, "", diffusers_name, count=1)
+        diffusers_name = re.sub(r"\.\d+(?=\D*$)", "", diffusers_name, count=1)
     if ".in." in diffusers_name:
         diffusers_name = diffusers_name.replace("in.layers.2", "conv1")
     if ".out." in diffusers_name:
@@ -292,24 +309,16 @@ def _convert_unet_lora_key(key):
         diffusers_name = diffusers_name.replace("op", "conv")
     if "skip" in diffusers_name:
         diffusers_name = diffusers_name.replace("skip.connection", "conv_shortcut")
-
-    # LyCORIS specific conversions.
     if "time.emb.proj" in diffusers_name:
         diffusers_name = diffusers_name.replace("time.emb.proj", "time_emb_proj")
     if "conv.shortcut" in diffusers_name:
         diffusers_name = diffusers_name.replace("conv.shortcut", "conv_shortcut")
 
-    # General conversions.
+    # General conversions for transformer/attn
     if "transformer_blocks" in diffusers_name:
         if "attn1" in diffusers_name or "attn2" in diffusers_name:
             diffusers_name = diffusers_name.replace("attn1", "attn1.processor")
             diffusers_name = diffusers_name.replace("attn2", "attn2.processor")
-        elif "ff" in diffusers_name:
-            pass
-    elif any(key in diffusers_name for key in ("proj_in", "proj_out")):
-        pass
-    else:
-        pass
 
     return diffusers_name
 
@@ -332,11 +341,8 @@ def _convert_text_encoder_lora_key(key, lora_name):
     diffusers_name = diffusers_name.replace("out.proj.lora", "to_out_lora")
     diffusers_name = diffusers_name.replace("text.projection", "text_projection")
 
-    if "self_attn" in diffusers_name or "text_projection" in diffusers_name:
-        pass
-    elif "mlp" in diffusers_name:
-        # Be aware that this is the new diffusers convention and the rest of the code might
-        # not utilize it yet.
+    if "mlp" in diffusers_name and "self_attn" not in diffusers_name and "text_projection" not in diffusers_name:
+        # Only replace for mlp blocks (not for attention or projection)
         diffusers_name = diffusers_name.replace(".lora.", ".lora_linear_layer.")
 
     return diffusers_name
