@@ -246,10 +246,7 @@ class WanResidualBlock(nn.Module):
 
         if feat_cache is not None:
             idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                cache_x = torch.cat([feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2)
-
+            cache_x = WanResidualBlock._update_cache(x, feat_cache, idx)
             x = self.conv1(x, feat_cache[idx])
             feat_cache[idx] = cache_x
             feat_idx[0] += 1
@@ -259,16 +256,11 @@ class WanResidualBlock(nn.Module):
         # Second normalization and activation
         x = self.norm2(x)
         x = self.nonlinearity(x)
-
-        # Dropout
         x = self.dropout(x)
 
         if feat_cache is not None:
             idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                cache_x = torch.cat([feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2)
-
+            cache_x = WanResidualBlock._update_cache(x, feat_cache, idx)
             x = self.conv2(x, feat_cache[idx])
             feat_cache[idx] = cache_x
             feat_idx[0] += 1
@@ -277,6 +269,19 @@ class WanResidualBlock(nn.Module):
 
         # Add residual connection
         return x + h
+
+    @staticmethod
+    def _update_cache(x, cache, idx):
+        # This helper avoids repeated slices and redundant .clone()
+        cache_x = x[:, :, -CACHE_T:, :, :]
+        cache_x = cache_x.clone() if x.is_contiguous(memory_format=torch.contiguous_format) else cache_x.contiguous().clone()
+        if cache_x.shape[2] < 2 and cache[idx] is not None:
+            last_frame = cache[idx][:, :, -1, :, :]
+            last_frame = last_frame.unsqueeze(2)
+            if last_frame.device != cache_x.device:
+                last_frame = last_frame.to(cache_x.device)
+            cache_x = torch.cat([last_frame, cache_x], dim=2)
+        return cache_x
 
 
 class WanAttentionBlock(nn.Module):
