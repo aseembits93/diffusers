@@ -135,7 +135,7 @@ def retrieve_timesteps(
     sigmas: Optional[List[float]] = None,
     **kwargs,
 ):
-    r"""
+    """
     Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
     custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
 
@@ -158,32 +158,44 @@ def retrieve_timesteps(
         `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
         second element is the number of inference steps.
     """
+    # Fast path: Avoid repetitive inspect/signature lookups using cached params per scheduler type
     if timesteps is not None and sigmas is not None:
         raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
     if timesteps is not None:
-        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
-        if not accepts_timesteps:
+        param_names = _get_set_timesteps_param_names(scheduler)
+        if "timesteps" not in param_names:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
                 f" timestep schedules. Please check whether you are using the correct scheduler."
             )
         scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
+        t_out = scheduler.timesteps
+        n_steps = len(t_out)
     elif sigmas is not None:
-        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
-        if not accept_sigmas:
+        param_names = _get_set_timesteps_param_names(scheduler)
+        if "sigmas" not in param_names:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
                 f" sigmas schedules. Please check whether you are using the correct scheduler."
             )
         scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
+        t_out = scheduler.timesteps
+        n_steps = len(t_out)
     else:
         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-    return timesteps, num_inference_steps
+        t_out = scheduler.timesteps
+        n_steps = num_inference_steps
+    return t_out, n_steps
+
+def _get_set_timesteps_param_names(scheduler):
+    # Use id rather than full class type to avoid keeping references
+    sid = id(type(scheduler))
+    if sid not in _param_names_cache:
+        sig = inspect.signature(scheduler.set_timesteps)
+        params = set(sig.parameters)
+        _param_names_cache[sid] = params
+        return params
+    return _param_names_cache[sid]
 
 
 class SanaPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
@@ -1003,3 +1015,5 @@ class SanaPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
             return (image,)
 
         return SanaPipelineOutput(images=image)
+
+_param_names_cache = {}
