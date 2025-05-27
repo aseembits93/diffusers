@@ -100,9 +100,8 @@ def basic_clean(text):
 
 
 def whitespace_clean(text):
-    text = re.sub(r"\s+", " ", text)
-    text = text.strip()
-    return text
+    # Pre-compiled regex and stdlib re for faster whitespace normalization
+    return _whitespace_re.sub(" ", text).strip()
 
 
 def prompt_clean(text):
@@ -744,3 +743,5 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             return (video,)
 
         return WanPipelineOutput(frames=video)
+
+_whitespace_re = re.compile(r"\s+")
