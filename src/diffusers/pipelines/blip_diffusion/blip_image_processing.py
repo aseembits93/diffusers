@@ -35,6 +35,7 @@ from transformers.image_utils import (
 from transformers.utils import TensorType, is_vision_available, logging
 
 from diffusers.utils import numpy_to_pil
+import PIL.Image
 
 
 if is_vision_available():
@@ -226,17 +227,18 @@ class BlipImageProcessor(BaseImageProcessor):
                 - `"channels_last"` or `ChannelDimension.LAST`: image in (height, width, num_channels) format.
                 - `"none"` or `ChannelDimension.NONE`: image in (height, width) format.
         """
-        do_resize = do_resize if do_resize is not None else self.do_resize
-        resample = resample if resample is not None else self.resample
-        do_rescale = do_rescale if do_rescale is not None else self.do_rescale
-        rescale_factor = rescale_factor if rescale_factor is not None else self.rescale_factor
-        do_normalize = do_normalize if do_normalize is not None else self.do_normalize
-        image_mean = image_mean if image_mean is not None else self.image_mean
-        image_std = image_std if image_std is not None else self.image_std
-        do_convert_rgb = do_convert_rgb if do_convert_rgb is not None else self.do_convert_rgb
-        do_center_crop = do_center_crop if do_center_crop is not None else self.do_center_crop
+        # Inline configuration checks and propagate directly. 
+        do_resize = self.do_resize if do_resize is None else do_resize
+        resample = self.resample if resample is None else resample
+        do_rescale = self.do_rescale if do_rescale is None else do_rescale
+        rescale_factor = self.rescale_factor if rescale_factor is None else rescale_factor
+        do_normalize = self.do_normalize if do_normalize is None else do_normalize
+        image_mean = self.image_mean if image_mean is None else image_mean
+        image_std = self.image_std if image_std is None else image_std
+        do_convert_rgb = self.do_convert_rgb if do_convert_rgb is None else do_convert_rgb
+        do_center_crop = self.do_center_crop if do_center_crop is None else do_center_crop
 
-        size = size if size is not None else self.size
+        size = self.size if size is None else size
         size = get_size_dict(size, default_to_square=False)
         images = make_list_of_images(images)
 
@@ -246,53 +248,56 @@ class BlipImageProcessor(BaseImageProcessor):
                 "torch.Tensor, tf.Tensor or jax.ndarray."
             )
 
-        if do_resize and size is None or resample is None:
+        # Validate required params only once
+        if do_resize and (size is None or resample is None):
             raise ValueError("Size and resample must be specified if do_resize is True.")
-
         if do_rescale and rescale_factor is None:
             raise ValueError("Rescale factor must be specified if do_rescale is True.")
-
         if do_normalize and (image_mean is None or image_std is None):
             raise ValueError("Image mean and std must be specified if do_normalize is True.")
 
-        # PIL RGBA images are converted to RGB
+        # Set up for batched, in-place-transform style application.
+        # Fused initial image conversion steps into a single pass.
+        local_convert_to_rgb = convert_to_rgb
+        local_to_numpy_array = to_numpy_array
         if do_convert_rgb:
-            images = [convert_to_rgb(image) for image in images]
+            images = [local_to_numpy_array(local_convert_to_rgb(img)) for img in images]
+        else:
+            images = [local_to_numpy_array(img) for img in images]
 
-        # All transformations expect numpy arrays.
-        images = [to_numpy_array(image) for image in images]
-
-        if is_scaled_image(images[0]) and do_rescale:
+        # We only need to run is_scaled_image once since a warning suffices for batch input
+        if do_rescale and is_scaled_image(images[0]):
             logger.warning_once(
                 "It looks like you are trying to rescale already rescaled images. If the input"
                 " images have pixel values between 0 and 1, set `do_rescale=False` to avoid rescaling them again."
             )
+
         if input_data_format is None:
-            # We assume that all images have the same channel dimension format.
             input_data_format = infer_channel_dimension_format(images[0])
 
-        if do_resize:
-            images = [
-                self.resize(image=image, size=size, resample=resample, input_data_format=input_data_format)
-                for image in images
-            ]
+        # Apply all image transformations in as few passes as possible
+        # We pipeline the most likely steps below to avoid repeated intermediate arrays for each image
+        # This also leverages local lookups for faster loop execution
+        
+        local_resize = self.resize
+        local_rescale = self.rescale
+        local_normalize = self.normalize
+        local_center_crop = self.center_crop
+        local_to_channel_dimension_format = to_channel_dimension_format
 
-        if do_rescale:
-            images = [
-                self.rescale(image=image, scale=rescale_factor, input_data_format=input_data_format)
-                for image in images
-            ]
-        if do_normalize:
-            images = [
-                self.normalize(image=image, mean=image_mean, std=image_std, input_data_format=input_data_format)
-                for image in images
-            ]
-        if do_center_crop:
-            images = [self.center_crop(image, size, input_data_format=input_data_format) for image in images]
+        def pipeline(img):
+            if do_resize:
+                img = local_resize(image=img, size=size, resample=resample, input_data_format=input_data_format)
+            if do_rescale:
+                img = local_rescale(image=img, scale=rescale_factor, input_data_format=input_data_format)
+            if do_normalize:
+                img = local_normalize(image=img, mean=image_mean, std=image_std, input_data_format=input_data_format)
+            if do_center_crop:
+                img = local_center_crop(img, size, input_data_format=input_data_format)
+            img = local_to_channel_dimension_format(img, data_format, input_channel_dim=input_data_format)
+            return img
 
-        images = [
-            to_channel_dimension_format(image, data_format, input_channel_dim=input_data_format) for image in images
-        ]
+        images = [pipeline(img) for img in images]
 
         encoded_outputs = BatchFeature(data={"pixel_values": images}, tensor_type=return_tensors)
         return encoded_outputs
