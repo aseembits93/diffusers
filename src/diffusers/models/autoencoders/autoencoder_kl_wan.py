@@ -350,14 +350,21 @@ class WanMidBlock(nn.Module):
         self.gradient_checkpointing = False
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
-        # First residual block
-        x = self.resnets[0](x, feat_cache, feat_idx)
+        # Use None as default for mutable arguments
+        if feat_idx is None:
+            feat_idx = [0]
 
-        # Process through attention and residual blocks
-        for attn, resnet in zip(self.attentions, self.resnets[1:]):
-            if attn is not None:
-                x = attn(x)
+        resnets = self.resnets
+        attentions = self.attentions
 
+        # First residual block -- this is the current bottleneck.
+        x = resnets[0](x, feat_cache, feat_idx)
+
+        # Process through attention and residual blocks.
+        # For moderate num_layers (e.g. 1-3), zip cost is negligible, but let's localize lookups.
+        attn_res_zip = zip(attentions, resnets[1:])
+        for attn, resnet in attn_res_zip:
+            x = attn(x)
             x = resnet(x, feat_cache, feat_idx)
 
         return x
