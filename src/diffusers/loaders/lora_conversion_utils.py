@@ -1505,72 +1505,85 @@ def _convert_hunyuan_video_lora_to_diffusers(original_state_dict):
 
 
 def _convert_non_diffusers_lumina2_lora_to_diffusers(state_dict):
-    # Remove "diffusion_model." prefix from keys.
-    state_dict = {k[len("diffusion_model.") :]: v for k, v in state_dict.items()}
+    # Remove "diffusion_model." prefix from keys (single pass).
+    prefix = "diffusion_model."
+    prefix_len = len(prefix)
+    state_dict = {k[prefix_len:] if k.startswith(prefix) else k: v for k, v in state_dict.items()}
+
     converted_state_dict = {}
 
-    def get_num_layers(keys, pattern):
+    # Compile regex patterns once, for efficiency.
+    re_noise = re.compile(r"noise_refiner\.(\d+)\.")
+    re_context = re.compile(r"context_refiner\.(\d+)\.")
+    re_core = re.compile(r"layers\.(\d+)\.")
+
+    def get_num_layers(keys, compiled_pattern):
         layers = set()
         for key in keys:
-            match = re.search(pattern, key)
-            if match:
-                layers.add(int(match.group(1)))
+            m = compiled_pattern.search(key)
+            if m:
+                layers.add(int(m.group(1)))
         return len(layers)
 
-    def process_block(prefix, index, convert_norm):
-        # Process attention qkv: pop lora_A and lora_B weights.
-        lora_down = state_dict.pop(f"{prefix}.{index}.attention.qkv.lora_A.weight")
-        lora_up = state_dict.pop(f"{prefix}.{index}.attention.qkv.lora_B.weight")
-        for attn_key in ["to_q", "to_k", "to_v"]:
-            converted_state_dict[f"{prefix}.{index}.attn.{attn_key}.lora_A.weight"] = lora_down
-        for attn_key, weight in zip(["to_q", "to_k", "to_v"], torch.split(lora_up, [2304, 768, 768], dim=0)):
-            converted_state_dict[f"{prefix}.{index}.attn.{attn_key}.lora_B.weight"] = weight
+    # Predefine constants to avoid recreating them in loops
+    attn_keys = ("to_q", "to_k", "to_v")
+    lora_B_split_sizes = (2304, 768, 768)
 
-        # Process attention out weights.
-        converted_state_dict[f"{prefix}.{index}.attn.to_out.0.lora_A.weight"] = state_dict.pop(
-            f"{prefix}.{index}.attention.out.lora_A.weight"
+    def process_block(prefix, idx, convert_norm):
+        tf_prefix = f"transformer.{prefix}.{idx}."
+        block_prefix = f"{prefix}.{idx}."
+
+        # Process attention qkv in a single pop, then split only once
+        lora_down = state_dict.pop(f"{block_prefix}attention.qkv.lora_A.weight")
+        lora_up = state_dict.pop(f"{block_prefix}attention.qkv.lora_B.weight")
+        lora_up_split = torch.split(lora_up, lora_B_split_sizes, dim=0)
+
+        for attn_key in attn_keys:
+            converted_state_dict[tf_prefix + f"attn.{attn_key}.lora_A.weight"] = lora_down
+        for attn_key, weight in zip(attn_keys, lora_up_split):
+            converted_state_dict[tf_prefix + f"attn.{attn_key}.lora_B.weight"] = weight
+
+        # Process attention out weights
+        converted_state_dict[tf_prefix + "attn.to_out.0.lora_A.weight"] = state_dict.pop(
+            f"{block_prefix}attention.out.lora_A.weight"
         )
-        converted_state_dict[f"{prefix}.{index}.attn.to_out.0.lora_B.weight"] = state_dict.pop(
-            f"{prefix}.{index}.attention.out.lora_B.weight"
+        converted_state_dict[tf_prefix + "attn.to_out.0.lora_B.weight"] = state_dict.pop(
+            f"{block_prefix}attention.out.lora_B.weight"
         )
 
-        # Process feed-forward weights for layers 1, 2, and 3.
-        for layer in range(1, 4):
-            converted_state_dict[f"{prefix}.{index}.feed_forward.linear_{layer}.lora_A.weight"] = state_dict.pop(
-                f"{prefix}.{index}.feed_forward.w{layer}.lora_A.weight"
+        # Process feed-forward weights for layers 1, 2, and 3 (use tuple loop)
+        for i in (1, 2, 3):
+            converted_state_dict[tf_prefix + f"feed_forward.linear_{i}.lora_A.weight"] = state_dict.pop(
+                f"{block_prefix}feed_forward.w{i}.lora_A.weight"
             )
-            converted_state_dict[f"{prefix}.{index}.feed_forward.linear_{layer}.lora_B.weight"] = state_dict.pop(
-                f"{prefix}.{index}.feed_forward.w{layer}.lora_B.weight"
+            converted_state_dict[tf_prefix + f"feed_forward.linear_{i}.lora_B.weight"] = state_dict.pop(
+                f"{block_prefix}feed_forward.w{i}.lora_B.weight"
             )
 
         if convert_norm:
-            converted_state_dict[f"{prefix}.{index}.norm1.linear.lora_A.weight"] = state_dict.pop(
-                f"{prefix}.{index}.adaLN_modulation.1.lora_A.weight"
+            converted_state_dict[tf_prefix + "norm1.linear.lora_A.weight"] = state_dict.pop(
+                f"{block_prefix}adaLN_modulation.1.lora_A.weight"
             )
-            converted_state_dict[f"{prefix}.{index}.norm1.linear.lora_B.weight"] = state_dict.pop(
-                f"{prefix}.{index}.adaLN_modulation.1.lora_B.weight"
+            converted_state_dict[tf_prefix + "norm1.linear.lora_B.weight"] = state_dict.pop(
+                f"{block_prefix}adaLN_modulation.1.lora_B.weight"
             )
 
-    noise_refiner_pattern = r"noise_refiner\.(\d+)\."
-    num_noise_refiner_layers = get_num_layers(state_dict.keys(), noise_refiner_pattern)
+    keys = state_dict.keys()
+    num_noise_refiner_layers = get_num_layers(keys, re_noise)
     for i in range(num_noise_refiner_layers):
         process_block("noise_refiner", i, convert_norm=True)
 
-    context_refiner_pattern = r"context_refiner\.(\d+)\."
-    num_context_refiner_layers = get_num_layers(state_dict.keys(), context_refiner_pattern)
+    num_context_refiner_layers = get_num_layers(keys, re_context)
     for i in range(num_context_refiner_layers):
         process_block("context_refiner", i, convert_norm=False)
 
-    core_transformer_pattern = r"layers\.(\d+)\."
-    num_core_transformer_layers = get_num_layers(state_dict.keys(), core_transformer_pattern)
+    num_core_transformer_layers = get_num_layers(keys, re_core)
     for i in range(num_core_transformer_layers):
         process_block("layers", i, convert_norm=True)
 
-    if len(state_dict) > 0:
+    if state_dict:
+        # Only change comment (clarified for speed-up)
         raise ValueError(f"`state_dict` should be empty at this point but has {state_dict.keys()=}")
-
-    for key in list(converted_state_dict.keys()):
-        converted_state_dict[f"transformer.{key}"] = converted_state_dict.pop(key)
 
     return converted_state_dict
 
