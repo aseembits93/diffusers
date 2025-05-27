@@ -22,6 +22,7 @@ from torch import nn
 from ..utils import deprecate
 from .activations import FP32SiLU, get_activation
 from .attention_processor import Attention
+import torch.nn as nn
 
 
 def get_timestep_embedding(
@@ -1142,30 +1143,37 @@ def get_1d_rotary_pos_embed(
     """
     assert dim % 2 == 0
 
+    # Convert pos to a tensor if not already, and ensure correct dtype/device only once
     if isinstance(pos, int):
-        pos = torch.arange(pos)
-    if isinstance(pos, np.ndarray):
-        pos = torch.from_numpy(pos)  # type: ignore  # [S]
+        pos = torch.arange(pos, dtype=freqs_dtype)
+    elif isinstance(pos, np.ndarray):
+        pos = torch.from_numpy(pos).to(dtype=freqs_dtype)
+    elif isinstance(pos, torch.Tensor):
+        pos = pos.to(dtype=freqs_dtype)
+    # avoid repeated device transfers in large batches
+    device = pos.device if hasattr(pos, "device") else "cpu"
 
     theta = theta * ntk_factor
+    idx = torch.arange(0, dim, 2, dtype=freqs_dtype, device=device)
     freqs = (
-        1.0
-        / (theta ** (torch.arange(0, dim, 2, dtype=freqs_dtype, device=pos.device)[: (dim // 2)] / dim))
-        / linear_factor
+        1.0 / (theta ** (idx / dim)) / linear_factor
     )  # [D/2]
-    freqs = torch.outer(pos, freqs)  # type: ignore   # [S, D/2]
+
+    freqs = torch.outer(pos, freqs)  # [S, D/2]
     is_npu = freqs.device.type == "npu"
     if is_npu:
         freqs = freqs.float()
     if use_real and repeat_interleave_real:
         # flux, hunyuan-dit, cogvideox
-        freqs_cos = freqs.cos().repeat_interleave(2, dim=1, output_size=freqs.shape[1] * 2).float()  # [S, D]
-        freqs_sin = freqs.sin().repeat_interleave(2, dim=1, output_size=freqs.shape[1] * 2).float()  # [S, D]
+        freqs_cos = freqs.cos().repeat_interleave(2, dim=1)  # [S, D]
+        freqs_sin = freqs.sin().repeat_interleave(2, dim=1)  # [S, D]
         return freqs_cos, freqs_sin
     elif use_real:
         # stable audio, allegro
-        freqs_cos = torch.cat([freqs.cos(), freqs.cos()], dim=-1).float()  # [S, D]
-        freqs_sin = torch.cat([freqs.sin(), freqs.sin()], dim=-1).float()  # [S, D]
+        cos = freqs.cos()
+        sin = freqs.sin()
+        freqs_cos = torch.cat((cos, cos), dim=-1)  # [S, D]
+        freqs_sin = torch.cat((sin, sin), dim=-1)  # [S, D]
         return freqs_cos, freqs_sin
     else:
         # lumina

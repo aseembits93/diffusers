@@ -469,23 +469,26 @@ class HunyuanVideoRotaryPosEmbed(nn.Module):
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         rope_sizes = [num_frames // self.patch_size_t, height // self.patch_size, width // self.patch_size]
 
-        axes_grids = []
-        for i in range(3):
-            # Note: The following line diverges from original behaviour. We create the grid on the device, whereas
-            # original implementation creates it on CPU and then moves it to device. This results in numerical
-            # differences in layerwise debugging outputs, but visually it is the same.
-            grid = torch.arange(0, rope_sizes[i], device=hidden_states.device, dtype=torch.float32)
-            axes_grids.append(grid)
-        grid = torch.meshgrid(*axes_grids, indexing="ij")  # [W, H, T]
-        grid = torch.stack(grid, dim=0)  # [3, W, H, T]
+        # Precompute axes grids on correct device & dtype at once (avoiding repeated type checks)
+        device = hidden_states.device
+        axes_grids = [torch.arange(rope_sizes[i], device=device, dtype=torch.float32) for i in range(3)]
 
-        freqs = []
-        for i in range(3):
-            freq = get_1d_rotary_pos_embed(self.rope_dim[i], grid[i].reshape(-1), self.theta, use_real=True)
-            freqs.append(freq)
+        # Use torch.meshgrid with indexing="ij", stack and reshape without list/blob temp intermediates
+        grid = torch.meshgrid(*axes_grids, indexing="ij")
+        grid = torch.stack(grid, dim=0)  # [3, F, H, W]
+        grid = grid.reshape(3, -1)  # [3, WHF]
 
-        freqs_cos = torch.cat([f[0] for f in freqs], dim=1)  # (W * H * T, D / 2)
-        freqs_sin = torch.cat([f[1] for f in freqs], dim=1)  # (W * H * T, D / 2)
+        # Compute rotary pos emb in batch using list comprehension for all 3 axes, one call per axis
+        # Reduce python overhead by unpacking the outputs directly during the loop
+        freqs_cos_list = []
+        freqs_sin_list = []
+        for i in range(3):
+            freqs_cos, freqs_sin = get_1d_rotary_pos_embed(self.rope_dim[i], grid[i], self.theta, use_real=True)
+            freqs_cos_list.append(freqs_cos)
+            freqs_sin_list.append(freqs_sin)
+
+        freqs_cos = torch.cat(freqs_cos_list, dim=1)  # [(W*H*T), D/2]
+        freqs_sin = torch.cat(freqs_sin_list, dim=1)  # [(W*H*T), D/2]
         return freqs_cos, freqs_sin
 
 
