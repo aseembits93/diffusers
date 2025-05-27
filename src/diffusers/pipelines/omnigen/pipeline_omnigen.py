@@ -27,6 +27,7 @@ from ...utils import is_torch_xla_available, logging, replace_example_docstring
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline, ImagePipelineOutput
 from .processor_omnigen import OmniGenMultiModalProcessor
+from functools import lru_cache
 
 
 if is_torch_xla_available():
@@ -63,7 +64,7 @@ def retrieve_timesteps(
     sigmas: Optional[List[float]] = None,
     **kwargs,
 ):
-    r"""
+    """
     Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
     custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
 
@@ -88,30 +89,49 @@ def retrieve_timesteps(
     """
     if timesteps is not None and sigmas is not None:
         raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
+    cls = type(scheduler)
+    accepts_timesteps, accepts_sigmas = _get_set_timesteps_param_flags(cls)
     if timesteps is not None:
-        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
         if not accepts_timesteps:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
                 f" timestep schedules. Please check whether you are using the correct scheduler."
             )
         scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
+        timesteps_val = scheduler.timesteps
+        num_inference_steps_val = len(timesteps_val)
     elif sigmas is not None:
-        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
-        if not accept_sigmas:
+        if not accepts_sigmas:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
                 f" sigmas schedules. Please check whether you are using the correct scheduler."
             )
         scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
+        timesteps_val = scheduler.timesteps
+        num_inference_steps_val = len(timesteps_val)
     else:
         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-    return timesteps, num_inference_steps
+        timesteps_val = scheduler.timesteps
+        num_inference_steps_val = num_inference_steps
+    return timesteps_val, num_inference_steps_val
+
+
+# Helper caches argument names for scheduler.set_timesteps at the class level
+@lru_cache(maxsize=64)
+def _get_set_timesteps_param_flags(cls):
+    """
+    For a given scheduler class, returns a tuple
+    (accepts_timesteps: bool, accepts_sigmas: bool)
+    """
+    try:
+        sig = inspect.signature(cls.set_timesteps)
+        params = sig.parameters
+        accepts_timesteps = "timesteps" in params
+        accepts_sigmas = "sigmas" in params
+    except (AttributeError, ValueError, TypeError):
+        accepts_timesteps = False
+        accepts_sigmas = False
+    return accepts_timesteps, accepts_sigmas
 
 
 class OmniGenPipeline(
