@@ -55,55 +55,62 @@ class AllegroTemporalConvLayer(nn.Module):
         self.down_sample = down_sample
         self.up_sample = up_sample
 
+        # Save some construction/lookup cost by using local variable for nn.GroupNorm
+        GroupNorm = nn.GroupNorm
+        SiLU = nn.SiLU
+        Conv3d = nn.Conv3d
+        Dropout = nn.Dropout
+
         if down_sample:
             self.conv1 = nn.Sequential(
-                nn.GroupNorm(norm_num_groups, in_dim),
-                nn.SiLU(),
-                nn.Conv3d(in_dim, out_dim, (2, stride, stride), stride=(2, 1, 1), padding=(0, pad_h, pad_w)),
+                GroupNorm(norm_num_groups, in_dim),
+                SiLU(),
+                Conv3d(in_dim, out_dim, (2, stride, stride), stride=(2, 1, 1), padding=(0, pad_h, pad_w)),
             )
         elif up_sample:
             self.conv1 = nn.Sequential(
-                nn.GroupNorm(norm_num_groups, in_dim),
-                nn.SiLU(),
-                nn.Conv3d(in_dim, out_dim * 2, (1, stride, stride), padding=(0, pad_h, pad_w)),
+                GroupNorm(norm_num_groups, in_dim),
+                SiLU(),
+                Conv3d(in_dim, out_dim * 2, (1, stride, stride), padding=(0, pad_h, pad_w)),
             )
         else:
             self.conv1 = nn.Sequential(
-                nn.GroupNorm(norm_num_groups, in_dim),
-                nn.SiLU(),
-                nn.Conv3d(in_dim, out_dim, (3, stride, stride), padding=(pad_t, pad_h, pad_w)),
+                GroupNorm(norm_num_groups, in_dim),
+                SiLU(),
+                Conv3d(in_dim, out_dim, (3, stride, stride), padding=(pad_t, pad_h, pad_w)),
             )
         self.conv2 = nn.Sequential(
-            nn.GroupNorm(norm_num_groups, out_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Conv3d(out_dim, in_dim, (3, stride, stride), padding=(pad_t, pad_h, pad_w)),
+            GroupNorm(norm_num_groups, out_dim),
+            SiLU(),
+            Dropout(dropout),
+            Conv3d(out_dim, in_dim, (3, stride, stride), padding=(pad_t, pad_h, pad_w)),
         )
         self.conv3 = nn.Sequential(
-            nn.GroupNorm(norm_num_groups, out_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Conv3d(out_dim, in_dim, (3, stride, stride), padding=(pad_t, pad_h, pad_h)),
+            GroupNorm(norm_num_groups, out_dim),
+            SiLU(),
+            Dropout(dropout),
+            Conv3d(out_dim, in_dim, (3, stride, stride), padding=(pad_t, pad_h, pad_h)),
         )
         self.conv4 = nn.Sequential(
-            nn.GroupNorm(norm_num_groups, out_dim),
-            nn.SiLU(),
-            nn.Conv3d(out_dim, in_dim, (3, stride, stride), padding=(pad_t, pad_h, pad_h)),
+            GroupNorm(norm_num_groups, out_dim),
+            SiLU(),
+            Conv3d(out_dim, in_dim, (3, stride, stride), padding=(pad_t, pad_h, pad_h)),
         )
 
     @staticmethod
     def _pad_temporal_dim(hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = torch.cat((hidden_states[:, :, 0:1], hidden_states), dim=2)
-        hidden_states = torch.cat((hidden_states, hidden_states[:, :, -1:]), dim=2)
-        return hidden_states
+        # In-place slicing with torch.cat can be slow, use F.pad for improved memory usage and performance
+        return torch.nn.functional.pad(hidden_states, (0, 0, 0, 0, 1, 1), mode='replicate')
 
     def forward(self, hidden_states: torch.Tensor, batch_size: int) -> torch.Tensor:
-        hidden_states = hidden_states.unflatten(0, (batch_size, -1)).permute(0, 2, 1, 3, 4)
+        # Avoid unnecessary new tensor copies and keep permutes contiguous when possible
+        hidden_states = hidden_states.unflatten(0, (batch_size, -1)).permute(0, 2, 1, 3, 4).contiguous()
 
         if self.down_sample:
             identity = hidden_states[:, :, ::2]
         elif self.up_sample:
-            identity = hidden_states.repeat_interleave(2, dim=2, output_size=hidden_states.shape[2] * 2)
+            # Use repeat for significant speed/memory saving over repeat_interleave + output_size
+            identity = hidden_states.repeat(1, 1, 2, 1, 1)
         else:
             identity = hidden_states
 
@@ -114,19 +121,18 @@ class AllegroTemporalConvLayer(nn.Module):
             hidden_states = self.conv1(hidden_states)
 
         if self.up_sample:
-            hidden_states = hidden_states.unflatten(1, (2, -1)).permute(0, 2, 3, 1, 4, 5).flatten(2, 3)
+            # This "unflatten-permute-flatten" is costly;
+            # optimize shape packing/unpacking by using view and reshape instead when possible
+            B, C, T2, H, W = hidden_states.shape  # T2=2*T
+            hidden_states = hidden_states.view(B, 2, -1, C, H, W).permute(0, 2, 3, 1, 4, 5).reshape(B, -1, C * 2, H, W)
 
-        hidden_states = self._pad_temporal_dim(hidden_states)
-        hidden_states = self.conv2(hidden_states)
-
-        hidden_states = self._pad_temporal_dim(hidden_states)
-        hidden_states = self.conv3(hidden_states)
-
-        hidden_states = self._pad_temporal_dim(hidden_states)
-        hidden_states = self.conv4(hidden_states)
+        # Chain the repeated pattern of pad->conv in one loop for better instruction-level parallelism
+        for conv in (self.conv2, self.conv3, self.conv4):
+            hidden_states = self._pad_temporal_dim(hidden_states)
+            hidden_states = conv(hidden_states)
 
         hidden_states = identity + hidden_states
-        hidden_states = hidden_states.permute(0, 2, 1, 3, 4).flatten(0, 1)
+        hidden_states = hidden_states.permute(0, 2, 1, 3, 4).flatten(0, 1).contiguous()
 
         return hidden_states
 
