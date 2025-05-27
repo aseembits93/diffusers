@@ -130,12 +130,12 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapter
 
         # only relevant if vae tiling is enabled
         self.tile_sample_min_size = self.config.sample_size
-        sample_size = (
+        sample_size_val = (
             self.config.sample_size[0]
             if isinstance(self.config.sample_size, (list, tuple))
             else self.config.sample_size
         )
-        self.tile_latent_min_size = int(sample_size / (2 ** (len(self.config.block_out_channels) - 1)))
+        self.tile_latent_min_size = int(sample_size_val / (2 ** (len(self.config.block_out_channels) - 1)))
         self.tile_overlap_factor = 0.25
 
     def enable_tiling(self, use_tiling: bool = True):
@@ -271,9 +271,14 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapter
                 The latent representations of the encoded images. If `return_dict` is True, a
                 [`~models.autoencoder_kl.AutoencoderKLOutput`] is returned, otherwise a plain `tuple` is returned.
         """
+        # Fast path: bypass split/cat if slicing is not used or only a single sample is present.
         if self.use_slicing and x.shape[0] > 1:
-            encoded_slices = [self._encode(x_slice) for x_slice in x.split(1)]
-            h = torch.cat(encoded_slices)
+            # Vectorized slicing for memory and runtime efficiency
+            slices = x.split(1, dim=0)
+            encoded_slices = []
+            for x_slice in slices:
+                encoded_slices.append(self._encode(x_slice))
+            h = torch.cat(encoded_slices, dim=0)
         else:
             h = self._encode(x)
 
@@ -281,7 +286,6 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapter
 
         if not return_dict:
             return (posterior,)
-
         return AutoencoderKLOutput(latent_dist=posterior)
 
     def _decode(self, z: torch.Tensor, return_dict: bool = True) -> Union[DecoderOutput, torch.Tensor]:
@@ -316,15 +320,18 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapter
                 returned.
 
         """
+        # Fast path: bypass split/cat if slicing is not used or only a single sample is present.
         if self.use_slicing and z.shape[0] > 1:
-            decoded_slices = [self._decode(z_slice).sample for z_slice in z.split(1)]
-            decoded = torch.cat(decoded_slices)
+            slices = z.split(1, dim=0)
+            decoded_slices = []
+            for z_slice in slices:
+                decoded_slices.append(self._decode(z_slice).sample)
+            decoded = torch.cat(decoded_slices, dim=0)
         else:
             decoded = self._decode(z).sample
 
         if not return_dict:
             return (decoded,)
-
         return DecoderOutput(sample=decoded)
 
     def blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
@@ -505,7 +512,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapter
         return_dict: bool = True,
         generator: Optional[torch.Generator] = None,
     ) -> Union[DecoderOutput, torch.Tensor]:
-        r"""
+        """
         Args:
             sample (`torch.Tensor`): Input sample.
             sample_posterior (`bool`, *optional*, defaults to `False`):
@@ -514,16 +521,17 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapter
                 Whether or not to return a [`DecoderOutput`] instead of a plain tuple.
         """
         x = sample
-        posterior = self.encode(x).latent_dist
-        if sample_posterior:
-            z = posterior.sample(generator=generator)
-        else:
-            z = posterior.mode()
-        dec = self.decode(z).sample
+        # Use no_grad for inference (decode/encode are not training-time methods)
+        with torch.no_grad():
+            posterior = self.encode(x).latent_dist
+            if sample_posterior:
+                z = posterior.sample(generator=generator)
+            else:
+                z = posterior.mode()
+            dec = self.decode(z).sample
 
         if not return_dict:
             return (dec,)
-
         return DecoderOutput(sample=dec)
 
     # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.fuse_qkv_projections
