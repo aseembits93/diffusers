@@ -328,19 +328,49 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapter
         return DecoderOutput(sample=decoded)
 
     def blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+        # Optimized vertical blending using vectorized operations
         blend_extent = min(a.shape[2], b.shape[2], blend_extent)
-        for y in range(blend_extent):
-            b[:, :, y, :] = a[:, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[:, :, y, :] * (y / blend_extent)
+        if blend_extent == 0:
+            return b
+        # Vectorized weights for blending
+        device = a.device
+        y_range = torch.arange(blend_extent, device=device, dtype=a.dtype)
+        w_b = y_range / blend_extent
+        w_a = 1.0 - w_b
+        # (blend_extent,) -> (1,1,blend_extent,1) for broadcasting
+        w_a = w_a.view(1, 1, blend_extent, 1)
+        w_b = w_b.view(1, 1, blend_extent, 1)
+        # Gather correct slices
+        a_slice = a[:, :, -blend_extent:, :]
+        b_slice = b[:, :, :blend_extent, :]
+        blended = a_slice * w_a + b_slice * w_b
+        # Inplace update
+        b[:, :, :blend_extent, :] = blended
         return b
 
     def blend_h(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+        # Optimized horizontal blending using vectorized operations
         blend_extent = min(a.shape[3], b.shape[3], blend_extent)
-        for x in range(blend_extent):
-            b[:, :, :, x] = a[:, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[:, :, :, x] * (x / blend_extent)
+        if blend_extent == 0:
+            return b
+        # Vectorized weights for blending
+        device = a.device
+        x_range = torch.arange(blend_extent, device=device, dtype=a.dtype)
+        w_b = x_range / blend_extent
+        w_a = 1.0 - w_b
+        # (blend_extent,) -> (1,1,1,blend_extent) for broadcasting
+        w_a = w_a.view(1, 1, 1, blend_extent)
+        w_b = w_b.view(1, 1, 1, blend_extent)
+        # Gather correct slices
+        a_slice = a[:, :, :, -blend_extent:]
+        b_slice = b[:, :, :, :blend_extent]
+        blended = a_slice * w_a + b_slice * w_b
+        # Inplace update
+        b[:, :, :, :blend_extent] = blended
         return b
 
     def _tiled_encode(self, x: torch.Tensor) -> torch.Tensor:
-        r"""Encode a batch of images using a tiled encoder.
+        """Encode a batch of images using a tiled encoder.
 
         When this option is enabled, the VAE will split the input tensor into tiles to compute encoding in several
         steps. This is useful to keep memory use constant regardless of image size. The end result of tiled encoding is
@@ -360,30 +390,40 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapter
         blend_extent = int(self.tile_latent_min_size * self.tile_overlap_factor)
         row_limit = self.tile_latent_min_size - blend_extent
 
-        # Split the image into 512x512 tiles and encode them separately.
         rows = []
-        for i in range(0, x.shape[2], overlap_size):
+        # Pre-calculate tile boundaries to avoid repeated computation in loop
+        h_tiles = list(range(0, x.shape[2], overlap_size))
+        w_tiles = list(range(0, x.shape[3], overlap_size))
+        tile_h = self.tile_sample_min_size
+        tile_w = self.tile_sample_min_size
+
+        # Store tiles to avoid recomputation
+        # Faster local lookup for use in blending
+        tile_rows = []
+        for i in h_tiles:
             row = []
-            for j in range(0, x.shape[3], overlap_size):
-                tile = x[:, :, i : i + self.tile_sample_min_size, j : j + self.tile_sample_min_size]
+            for j in w_tiles:
+                tile = x[:, :, i : i + tile_h, j : j + tile_w]
                 tile = self.encoder(tile)
                 if self.config.use_quant_conv:
                     tile = self.quant_conv(tile)
                 row.append(tile)
-            rows.append(row)
+            tile_rows.append(row)
+        rows = tile_rows
+
+        # Now blend vertically and horizontally
         result_rows = []
         for i, row in enumerate(rows):
             result_row = []
             for j, tile in enumerate(row):
-                # blend the above tile and the left tile
-                # to the current tile and add the current tile to the result row
                 if i > 0:
                     tile = self.blend_v(rows[i - 1][j], tile, blend_extent)
                 if j > 0:
                     tile = self.blend_h(row[j - 1], tile, blend_extent)
                 result_row.append(tile[:, :, :row_limit, :row_limit])
+            # torch.cat along width (dim=3)
             result_rows.append(torch.cat(result_row, dim=3))
-
+        # torch.cat along height (dim=2)
         enc = torch.cat(result_rows, dim=2)
         return enc
 
