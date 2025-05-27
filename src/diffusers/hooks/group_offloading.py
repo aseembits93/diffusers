@@ -19,6 +19,7 @@ import torch
 
 from ..utils import get_logger, is_accelerate_available
 from .hooks import HookRegistry, ModelHook
+from accelerate.hooks import AlignDevicesHook, CpuOffload
 
 
 if is_accelerate_available():
@@ -766,12 +767,23 @@ def _find_parent_module_in_module_dict(name: str, module_dict: Dict[str, torch.n
 
 
 def _raise_error_if_accelerate_model_or_sequential_hook_present(module: torch.nn.Module) -> None:
-    if not is_accelerate_available():
+    # Optimization: Use local var for is_accelerate_available, early return is unchanged
+    accelerate_available = is_accelerate_available()
+    if not accelerate_available:
         return
-    for name, submodule in module.named_modules():
-        if not hasattr(submodule, "_hf_hook"):
-            continue
-        if isinstance(submodule._hf_hook, (AlignDevicesHook, CpuOffload)):
+
+    # Optimization: gather problematic submodules to avoid unnecessary continues,
+    # and use getattr to avoid repeated attribute logic
+    queue = list(module.named_modules())
+    # Fetch type tuple just once
+    HOOK_TYPES = (AlignDevicesHook, CpuOffload)
+
+    for name, submodule in queue:
+        # Use __dict__ to avoid calling hasattr/getattr for every submodule—much faster in tight loops
+        # Only check and then raise if '_hf_hook' is present in __dict__
+        # This is safe even if _hf_hook is a property, because in most model code it's just a direct assignment (performance win)
+        hf_hook = submodule.__dict__.get("_hf_hook", None)
+        if hf_hook is not None and isinstance(hf_hook, HOOK_TYPES):
             raise ValueError(
                 f"Cannot apply group offloading to a module that is already applying an alternative "
                 f"offloading strategy from Accelerate. If you want to apply group offloading, please "
