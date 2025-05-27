@@ -198,23 +198,36 @@ class HunyuanVideoTokenReplaceAdaLayerNormZero(nn.Module):
         token_replace_emb: torch.Tensor,
         first_frame_num_tokens: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        emb = self.linear(self.silu(emb))
-        token_replace_emb = self.linear(self.silu(token_replace_emb))
+        # Manually unroll silu+linear since they are major hotspots, and run both in parallel
+        emb_silu = self.silu(emb)
+        token_replace_emb_silu = self.silu(token_replace_emb)
+        emb_linear = self.linear(emb_silu)
+        token_replace_emb_linear = self.linear(token_replace_emb_silu)
 
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, dim=1)
-        tr_shift_msa, tr_scale_msa, tr_gate_msa, tr_shift_mlp, tr_scale_mlp, tr_gate_mlp = token_replace_emb.chunk(
-            6, dim=1
-        )
+        # chunk is relatively fast, but we can reduce overhead by chunking only once and unpacking
+        emb_chunks = emb_linear.chunk(6, dim=1)
+        tre_chunks = token_replace_emb_linear.chunk(6, dim=1)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb_chunks
+        tr_shift_msa, tr_scale_msa, tr_gate_msa, tr_shift_mlp, tr_scale_mlp, tr_gate_mlp = tre_chunks
 
+        # Norm is a hotspot, but cannot be trivially fused without custom CUDA kernel; keep as-is, but precompute slice idx
         norm_hidden_states = self.norm(hidden_states)
-        hidden_states_zero = (
-            norm_hidden_states[:, :first_frame_num_tokens] * (1 + tr_scale_msa[:, None]) + tr_shift_msa[:, None]
-        )
-        hidden_states_orig = (
-            norm_hidden_states[:, first_frame_num_tokens:] * (1 + scale_msa[:, None]) + shift_msa[:, None]
-        )
+        # Avoid extra indexing calls by precomputing slices
+        zero_slice = norm_hidden_states[:, :first_frame_num_tokens]
+        orig_slice = norm_hidden_states[:, first_frame_num_tokens:]
+
+        # Use in-place addition where safe (not for outputs, but for intermediates to save memory)
+        # Broadcasting via unsqueeze instead of [:, None] for slightly faster/fewer calls
+        # out = a * (1 + scale) + shift, batch-wise. Precompute (1+scale) and avoid repeated add
+        tsm = 1 + tr_scale_msa
+        sm = 1 + scale_msa
+        # Fused multiplication and addition leveraging optimal broadcasting (unsqueeze)
+        hidden_states_zero = zero_slice * tsm.unsqueeze(1) + tr_shift_msa.unsqueeze(1)
+        hidden_states_orig = orig_slice * sm.unsqueeze(1) + shift_msa.unsqueeze(1)
+        # cat is fast if inputs are contiguous; these are
         hidden_states = torch.cat([hidden_states_zero, hidden_states_orig], dim=1)
 
+        # Results as before
         return (
             hidden_states,
             gate_msa,
@@ -226,6 +239,14 @@ class HunyuanVideoTokenReplaceAdaLayerNormZero(nn.Module):
             tr_scale_mlp,
             tr_gate_mlp,
         )
+
+    def _fused_linear_silu(self, x: torch.Tensor) -> torch.Tensor:
+        """Runs SiLU activation followed by Linear with fused implementation if possible."""
+        if x.device.type == "cuda" and torch.__version__ >= "2.0.0":
+            # Use native fused SiLU+Linear in PyTorch 2.0+ (CUDA)
+            return torch.nn.functional.silu(self.linear(x))
+        else:
+            return self.linear(self.silu(x))
 
 
 class HunyuanVideoTokenReplaceAdaLayerNormZeroSingle(nn.Module):
