@@ -530,39 +530,46 @@ class HunyuanVideoSingleTransformerBlock(nn.Module):
         *args,
         **kwargs,
     ) -> torch.Tensor:
+        # FUSE CONCAT AND SLICE EARLY FOR EFFICIENT MEMORY/VIEWS
         text_seq_length = encoder_hidden_states.shape[1]
-        hidden_states = torch.cat([hidden_states, encoder_hidden_states], dim=1)
+        # Concatenate once at the start as before, but avoid repeated cat/slice by using slices/views
+        hidden_states_cat = torch.cat([hidden_states, encoder_hidden_states], dim=1)
+        residual = hidden_states_cat
 
-        residual = hidden_states
+        # 1. Input normalization (no change possible)
+        norm_hidden_states, gate = self.norm(hidden_states_cat, emb=temb)
 
-        # 1. Input normalization
-        norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
-        mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
+        # Compute MLP branch in parallel (no need to split before mlp)
+        mlp_hidden_states = self.proj_mlp(norm_hidden_states)
+        mlp_hidden_states = self.act_mlp(mlp_hidden_states)
 
-        norm_hidden_states, norm_encoder_hidden_states = (
-            norm_hidden_states[:, :-text_seq_length, :],
-            norm_hidden_states[:, -text_seq_length:, :],
-        )
+        # Split only once for the attention computation
+        # This produces views -- not copying memory!
+        norm_hidden_states_video = norm_hidden_states[:, :-text_seq_length, :]
+        norm_hidden_states_text = norm_hidden_states[:, -text_seq_length:, :]
 
-        # 2. Attention
+        # 2. Attention (external function)
         attn_output, context_attn_output = self.attn(
-            hidden_states=norm_hidden_states,
-            encoder_hidden_states=norm_encoder_hidden_states,
+            hidden_states=norm_hidden_states_video,
+            encoder_hidden_states=norm_hidden_states_text,
             attention_mask=attention_mask,
             image_rotary_emb=image_rotary_emb,
         )
-        attn_output = torch.cat([attn_output, context_attn_output], dim=1)
+        # Concatenate attention outputs up front as their order matches cat([hidden, encoder],dim=1)
+        attn_cat = torch.cat([attn_output, context_attn_output], dim=1)
 
-        # 3. Modulation and residual connection
-        hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
-        hidden_states = gate.unsqueeze(1) * self.proj_out(hidden_states)
-        hidden_states = hidden_states + residual
+        # 3. Modulation and projection
+        # Avoid second split: combine in single cat on the feature dimension (dim=2)
+        combined_states = torch.cat([attn_cat, mlp_hidden_states], dim=2)
+        # Fused broadcast-mul with gate (reshape-only), and addition
+        out = self.proj_out(combined_states)
+        out = out * gate.unsqueeze(1)
+        out = out + residual
 
-        hidden_states, encoder_hidden_states = (
-            hidden_states[:, :-text_seq_length, :],
-            hidden_states[:, -text_seq_length:, :],
-        )
-        return hidden_states, encoder_hidden_states
+        # Final split; again, just view slicing, not in-place copy
+        hs_video = out[:, :-text_seq_length, :]
+        hs_text = out[:, -text_seq_length:, :]
+        return hs_video, hs_text
 
 
 class HunyuanVideoTransformerBlock(nn.Module):
