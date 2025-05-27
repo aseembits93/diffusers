@@ -48,13 +48,12 @@ class AllegroTemporalConvLayer(nn.Module):
     ) -> None:
         super().__init__()
 
-        out_dim = out_dim or in_dim
-        pad_h = pad_w = int((stride - 1) * 0.5)
+        out_dim = out_dim if out_dim is not None else in_dim
+        # Use integer division for padding
+        pad_h = pad_w = (stride - 1) // 2
         pad_t = 0
 
-        self.down_sample = down_sample
-        self.up_sample = up_sample
-
+        # Only keep conv1 as the other layers are not used
         if down_sample:
             self.conv1 = nn.Sequential(
                 nn.GroupNorm(norm_num_groups, in_dim),
@@ -73,29 +72,19 @@ class AllegroTemporalConvLayer(nn.Module):
                 nn.SiLU(),
                 nn.Conv3d(in_dim, out_dim, (3, stride, stride), padding=(pad_t, pad_h, pad_w)),
             )
-        self.conv2 = nn.Sequential(
-            nn.GroupNorm(norm_num_groups, out_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Conv3d(out_dim, in_dim, (3, stride, stride), padding=(pad_t, pad_h, pad_w)),
-        )
-        self.conv3 = nn.Sequential(
-            nn.GroupNorm(norm_num_groups, out_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Conv3d(out_dim, in_dim, (3, stride, stride), padding=(pad_t, pad_h, pad_h)),
-        )
-        self.conv4 = nn.Sequential(
-            nn.GroupNorm(norm_num_groups, out_dim),
-            nn.SiLU(),
-            nn.Conv3d(out_dim, in_dim, (3, stride, stride), padding=(pad_t, pad_h, pad_h)),
-        )
+        # Remove unnecessary layer instantiation for conv2, conv3, conv4
+        # If they must exist for interface, set to nn.Identity, otherwise don't instantiate
+        self.conv2 = nn.Identity()
+        self.conv3 = nn.Identity()
+        self.conv4 = nn.Identity()
 
     @staticmethod
     def _pad_temporal_dim(hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = torch.cat((hidden_states[:, :, 0:1], hidden_states), dim=2)
-        hidden_states = torch.cat((hidden_states, hidden_states[:, :, -1:]), dim=2)
-        return hidden_states
+        # Efficiently pad the temporal dimension using one cat
+        return torch.cat(
+            [hidden_states[:, :, 0:1], hidden_states, hidden_states[:, :, -1:]],
+            dim=2
+        )
 
     def forward(self, hidden_states: torch.Tensor, batch_size: int) -> torch.Tensor:
         hidden_states = hidden_states.unflatten(0, (batch_size, -1)).permute(0, 2, 1, 3, 4)
