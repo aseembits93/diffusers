@@ -135,7 +135,8 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapter
             if isinstance(self.config.sample_size, (list, tuple))
             else self.config.sample_size
         )
-        self.tile_latent_min_size = int(sample_size / (2 ** (len(self.config.block_out_channels) - 1)))
+        # Avoid redundant pow operation
+        self.tile_latent_min_size = sample_size >> (len(self.config.block_out_channels) - 1)
         self.tile_overlap_factor = 0.25
 
     def enable_tiling(self, use_tiling: bool = True):
@@ -328,9 +329,18 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapter
         return DecoderOutput(sample=decoded)
 
     def blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+        # Vectorized blending implementation for speedup.
         blend_extent = min(a.shape[2], b.shape[2], blend_extent)
-        for y in range(blend_extent):
-            b[:, :, y, :] = a[:, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[:, :, y, :] * (y / blend_extent)
+        if blend_extent <= 0:
+            return b
+        # Generate blending weights
+        device = a.device
+        dtype = a.dtype
+        y = torch.arange(blend_extent, device=device, dtype=dtype)
+        weights_a = (1 - y / blend_extent).reshape(1, 1, -1, 1)
+        weights_b = (y / blend_extent).reshape(1, 1, -1, 1)
+        a_slice = a[:, :, -blend_extent:, :]
+        b[:, :, :blend_extent, :] = a_slice * weights_a + b[:, :, :blend_extent, :] * weights_b
         return b
 
     def blend_h(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
