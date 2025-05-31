@@ -1350,30 +1350,39 @@ class Expectations(DevicePropertiesUserDict):
         (device_type, major) = key
         (other_device_type, other_major) = other
 
-        score = 0b0
+        # Use integer addition for points for even cheaper computation
+        score = 0
         if device_type == other_device_type:
-            score |= 0b1000
-        elif device_type in ["cuda", "rocm"] and other_device_type in ["cuda", "rocm"]:
-            score |= 0b100
+            score += 8
+        elif device_type in ("cuda", "rocm") and other_device_type in ("cuda", "rocm"):
+            score += 4
 
         if major == other_major and other_major is not None:
-            score |= 0b10
+            score += 2
 
-        if Expectations.is_default(other):
-            score |= 0b1
+        # Inline the is_default check instead of calling the static method
+        if other_device_type is None and other_major is None:
+            score += 1
 
-        return int(score)
+        return score
 
     def find_expectation(self, key: DeviceProperties = (None, None)) -> Any:
         """
         Find best matching expectation based on provided device properties.
         """
-        (result_key, result) = max(self.data.items(), key=lambda x: Expectations.score(key, x[0]))
-
-        if Expectations.score(key, result_key) == 0:
+        items = self.data.items()
+        # Precompute all scores to avoid recalculating
+        # Instead of calling score twice (once in max, once outside), keep best match score and result inline
+        max_score = -1
+        best_result = None
+        for result_key, result in items:
+            this_score = Expectations.score(key, result_key)
+            if this_score > max_score:
+                max_score = this_score
+                best_result = result
+        if max_score <= 0:
             raise ValueError(f"No matching expectation found for {key}")
-
-        return result
+        return best_result
 
     def __repr__(self):
         return f"{self.data}"
