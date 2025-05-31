@@ -1335,7 +1335,8 @@ class Expectations(DevicePropertiesUserDict):
 
     @staticmethod
     def is_default(key: DeviceProperties) -> bool:
-        return all(p is None for p in key)
+        # Faster: avoids generator and checks tuple directly
+        return key[0] is None and key[1] is None
 
     @staticmethod
     def score(key: DeviceProperties, other: DeviceProperties) -> int:
@@ -1347,22 +1348,22 @@ class Expectations(DevicePropertiesUserDict):
             * Matching `major` (compute capability major version) gives 2 points.
             * Default expectation (if present) gives 1 points.
         """
-        (device_type, major) = key
-        (other_device_type, other_major) = other
+        device_type, major = key
+        other_device_type, other_major = other
 
-        score = 0b0
+        score = 0
         if device_type == other_device_type:
-            score |= 0b1000
-        elif device_type in ["cuda", "rocm"] and other_device_type in ["cuda", "rocm"]:
-            score |= 0b100
+            score |= 8
+        elif device_type in ("cuda", "rocm") and other_device_type in ("cuda", "rocm"):
+            score |= 4
 
-        if major == other_major and other_major is not None:
-            score |= 0b10
+        if major is not None and major == other_major:
+            score |= 2
 
-        if Expectations.is_default(other):
-            score |= 0b1
+        if other_device_type is None and other_major is None:
+            score |= 1
 
-        return int(score)
+        return score
 
     def find_expectation(self, key: DeviceProperties = (None, None)) -> Any:
         """
