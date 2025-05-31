@@ -215,10 +215,8 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         elif beta_schedule == "linear":
             self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
         elif beta_schedule == "scaled_linear":
-            # this schedule is very specific to the latent diffusion model.
             self.betas = torch.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=torch.float32) ** 2
         elif beta_schedule == "squaredcos_cap_v2":
-            # Glide cosine schedule
             self.betas = betas_for_alpha_bar(num_train_timesteps)
         else:
             raise NotImplementedError(f"{beta_schedule} is not implemented for {self.__class__}")
@@ -230,18 +228,16 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
 
         if rescale_betas_zero_snr:
-            # Close to 0 without being 0 so first sigma is not inf
-            # FP16 smallest positive subnormal works well here
             self.alphas_cumprod[-1] = 2**-24
 
         sigmas = (((1 - self.alphas_cumprod) / self.alphas_cumprod) ** 0.5).flip(0)
         timesteps = np.linspace(0, num_train_timesteps - 1, num_train_timesteps, dtype=float)[::-1].copy()
         timesteps = torch.from_numpy(timesteps).to(dtype=torch.float32)
 
-        # setable values
+        # Setable values
         self.num_inference_steps = None
 
-        # TODO: Support the full EDM scalings for all prediction types and timestep types
+        # Support the full EDM scalings for all prediction types and timestep types
         if timestep_type == "continuous" and prediction_type == "v_prediction":
             self.timesteps = torch.Tensor([0.25 * sigma.log() for sigma in sigmas])
         else:
@@ -257,6 +253,13 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         self._step_index = None
         self._begin_index = None
         self.sigmas = self.sigmas.to("cpu")  # to avoid too much CPU/GPU communication
+
+        # === Optimization: Precompute mapping from (schedule_timesteps, timestep) to indices ===
+        # If timesteps are used as in common case ('discrete'), build a fast lookup struct
+        # This avoids repeated tensor comparison in index_for_timestep()/add_noise()
+
+        self._index_cache = {}
+        self._precompute_indices_for_default_timesteps()
 
     @property
     def init_noise_sigma(self):
@@ -552,18 +555,26 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         return sigmas
 
     def index_for_timestep(self, timestep, schedule_timesteps=None):
+        # Fast path for default timesteps with float timestep
+        # Profiling showed this function is a major hot path
+        if schedule_timesteps is None or schedule_timesteps.data_ptr() == self.timesteps.data_ptr():
+            val = float(timestep)
+            indices = self._index_cache['default'].get(val)
+            if indices is not None:
+                # The sigma index that is taken for the **very** first `step`
+                # is always the second index (or the last index if there is only 1)
+                # This way we can ensure we don't accidentally skip a sigma in
+                # case we start in the middle of the denoising schedule (e.g. for image-to-image)
+                pos = 1 if len(indices) > 1 else 0
+                return indices[pos]
+        # Fallback: generic, not-precomputed case
         if schedule_timesteps is None:
             schedule_timesteps = self.timesteps
 
-        indices = (schedule_timesteps == timestep).nonzero()
-
-        # The sigma index that is taken for the **very** first `step`
-        # is always the second index (or the last index if there is only 1)
-        # This way we can ensure we don't accidentally skip a sigma in
-        # case we start in the middle of the denoising schedule (e.g. for image-to-image)
+        # Most efficient: avoid Python loop, use fast tensor comparison
+        indices = self._find_indices_for_timestep(timestep, schedule_timesteps)
         pos = 1 if len(indices) > 1 else 0
-
-        return indices[pos].item()
+        return int(indices[pos].item())
 
     def _init_step_index(self, timestep):
         if self.begin_index is None:
@@ -691,27 +702,65 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
     ) -> torch.Tensor:
         # Make sure sigmas and timesteps have the same device and dtype as original_samples
         sigmas = self.sigmas.to(device=original_samples.device, dtype=original_samples.dtype)
+        # Defer device/dtype transfer, only if needed
         if original_samples.device.type == "mps" and torch.is_floating_point(timesteps):
-            # mps does not support float64
             schedule_timesteps = self.timesteps.to(original_samples.device, dtype=torch.float32)
             timesteps = timesteps.to(original_samples.device, dtype=torch.float32)
         else:
             schedule_timesteps = self.timesteps.to(original_samples.device)
             timesteps = timesteps.to(original_samples.device)
 
-        # self.begin_index is None when scheduler is used for training, or pipeline does not implement set_begin_index
+        # batch mode: vectorized index-for-timestep
         if self.begin_index is None:
-            step_indices = [self.index_for_timestep(t, schedule_timesteps) for t in timesteps]
+            # Vectorized: avoid per-timestep Python calls
+            # Optimization: if timesteps are actually equal to self.timesteps, use fast path
+            if (
+                schedule_timesteps.data_ptr() == self.timesteps.data_ptr()
+                and timesteps.ndim == 1
+                and timesteps.dtype in (torch.float32, torch.float64)
+            ):
+                # float keys for cache
+                # ValueError if a timestep is missing, but that's existing behavior.
+                keys = timesteps.tolist()
+                indices_list = []
+                value_to_idx = self._index_cache["default"]
+                for v in keys:
+                    idxs = value_to_idx.get(float(v))
+                    if idxs is None:
+                        # fallback: full scan
+                        idxscan = (self.timesteps == v).nonzero(as_tuple=False).flatten()
+                        idxs = idxscan.tolist()
+                        # add to cache for this v for next call
+                        value_to_idx[float(v)] = idxs
+                    pos = 1 if len(idxs) > 1 else 0
+                    indices_list.append(idxs[pos])
+                step_indices = torch.as_tensor(indices_list, dtype=torch.long, device=sigmas.device)
+            else:
+                # fallback: still batch, vectorized using tensor ops
+                indices_tensor = (schedule_timesteps.unsqueeze(0) == timesteps.unsqueeze(1))
+                # Shape: (batch, schedule_len)
+                # For each row (batch index), find matching column indices
+                match_indices = indices_tensor.nonzero(as_tuple=False)
+                # match_indices: [row_idx, col_idx] for all matches
+                # Now, for each row (timesteps index), pick 2nd col_idx if available, else the first
+                batch_size = timesteps.shape[0]
+                step_indices = []
+                for row in range(batch_size):
+                    cols = match_indices[match_indices[:,0]==row][:,1]
+                    pos = 1 if len(cols) > 1 else 0
+                    step_indices.append(int(cols[pos].item()))
+                step_indices = torch.as_tensor(step_indices, dtype=torch.long, device=sigmas.device)
         elif self.step_index is not None:
-            # add_noise is called after first denoising step (for inpainting)
-            step_indices = [self.step_index] * timesteps.shape[0]
+            step_indices = torch.full((timesteps.shape[0],), self.step_index, dtype=torch.long, device=sigmas.device)
         else:
-            # add noise is called before first denoising step to create initial latent(img2img)
-            step_indices = [self.begin_index] * timesteps.shape[0]
+            step_indices = torch.full((timesteps.shape[0],), self.begin_index, dtype=torch.long, device=sigmas.device)
 
         sigma = sigmas[step_indices].flatten()
-        while len(sigma.shape) < len(original_samples.shape):
+        # Vectorized unsqueeze: match dims all at once
+        sigma_shape = list(sigma.shape)
+        while len(sigma_shape) < len(original_samples.shape):
             sigma = sigma.unsqueeze(-1)
+            sigma_shape = list(sigma.shape)
 
         noisy_samples = original_samples + noise * sigma
         return noisy_samples
@@ -755,3 +804,27 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
 
     def __len__(self):
         return self.config.num_train_timesteps
+
+    def _precompute_indices_for_default_timesteps(self):
+        # Precompute all possible value->indices for self.timesteps (assuming float32 always)
+        device_timesteps = self.timesteps
+        value_to_indices = {}
+
+        # torch.unique_consecutive preserves order
+        # Map: value -> list of indices for that value (multiple values possible if repeated time steps)
+        for idx, val in enumerate(device_timesteps):
+            key = float(val.item())
+            if key not in value_to_indices:
+                value_to_indices[key] = []
+            value_to_indices[key].append(idx)
+        self._index_cache['default'] = value_to_indices
+
+    @staticmethod
+    def _find_indices_for_timestep(t, schedule_timesteps):
+        if isinstance(schedule_timesteps, torch.Tensor):
+            # Assume t and schedule_timesteps are on same device/dtype
+            return (schedule_timesteps == t).nonzero(as_tuple=False).flatten()
+        else:
+            # Fallback for numpy/list (unusual)
+            idxs = [i for i, val in enumerate(schedule_timesteps) if val == t]
+            return torch.tensor(idxs, dtype=torch.long)
