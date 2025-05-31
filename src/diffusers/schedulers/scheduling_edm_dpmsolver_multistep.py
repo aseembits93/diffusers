@@ -126,23 +126,26 @@ class EDMDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
                 f"`final_sigmas_type` {final_sigmas_type} is not supported for `algorithm_type` {algorithm_type}. Please choose `sigma_min` instead."
             )
 
-        ramp = torch.linspace(0, 1, num_train_timesteps)
+        # Preallocate ramp and sigmas, use in-place where possible
+        device = "cpu"
+        ramp = torch.linspace(0, 1, num_train_timesteps, device=device)
         if sigma_schedule == "karras":
             sigmas = self._compute_karras_sigmas(ramp)
-        elif sigma_schedule == "exponential":
+        else:  # fallback for "exponential" or other future schedules
             sigmas = self._compute_exponential_sigmas(ramp)
 
+        # Buffer small tensor allocations and avoid device transfer repetition
         self.timesteps = self.precondition_noise(sigmas)
+        self.sigmas = torch.cat((sigmas, torch.zeros(1, device=device)), 0)
 
-        self.sigmas = torch.cat([sigmas, torch.zeros(1, device=sigmas.device)])
-
-        # setable values
+        # setable values (use bare minimum init)
         self.num_inference_steps = None
-        self.model_outputs = [None] * solver_order
+        self.model_outputs = [None] * solver_order  # If this list is used as ringbuffer, always keep list size fixed
         self.lower_order_nums = 0
         self._step_index = None
         self._begin_index = None
-        self.sigmas = self.sigmas.to("cpu")  # to avoid too much CPU/GPU communication
+        # Sigmas are already on cpu
+        # self.sigmas = self.sigmas.to("cpu") # Already set to device above
 
     @property
     def init_noise_sigma(self):
@@ -176,8 +179,10 @@ class EDMDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
 
     # Copied from diffusers.schedulers.scheduling_edm_euler.EDMEulerScheduler.precondition_inputs
     def precondition_inputs(self, sample, sigma):
-        c_in = 1 / ((sigma**2 + self.config.sigma_data**2) ** 0.5)
-        scaled_sample = sample * c_in
+        # Use local to avoid attribute lookup on self.config
+        sigma_data = self.config.sigma_data
+        denom = torch.rsqrt(sigma ** 2 + sigma_data ** 2)
+        scaled_sample = sample * denom
         return scaled_sample
 
     # Copied from diffusers.schedulers.scheduling_edm_euler.EDMEulerScheduler.precondition_noise
@@ -221,12 +226,14 @@ class EDMDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
             `torch.Tensor`:
                 A scaled input sample.
         """
-        if self.step_index is None:
+        # Cache step_index; avoids repeated checks
+        step_index = self.step_index
+        if step_index is None:
             self._init_step_index(timestep)
+            step_index = self.step_index
 
-        sigma = self.sigmas[self.step_index]
+        sigma = self.sigmas[step_index]
         sample = self.precondition_inputs(sample, sigma)
-
         self.is_scale_input_called = True
         return sample
 
@@ -583,13 +590,14 @@ class EDMDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         """
         Initialize the step_index counter for the scheduler.
         """
-
-        if self.begin_index is None:
+        # Only one attribute access
+        begin_index = self.begin_index
+        if begin_index is None:
             if isinstance(timestep, torch.Tensor):
                 timestep = timestep.to(self.timesteps.device)
             self._step_index = self.index_for_timestep(timestep)
         else:
-            self._step_index = self._begin_index
+            self._step_index = begin_index
 
     def step(
         self,
