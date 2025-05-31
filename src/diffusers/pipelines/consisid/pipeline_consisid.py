@@ -32,6 +32,7 @@ from ...utils import is_opencv_available, logging, replace_example_docstring
 from ...utils.torch_utils import randn_tensor
 from ...video_processor import VideoProcessor
 from .pipeline_output import ConsisIDPipelineOutput
+import cv2
 
 
 if is_opencv_available():
@@ -111,31 +112,34 @@ def draw_kps(image_pil, kps, color_list=[(255, 0, 0), (0, 255, 0), (0, 0, 255), 
 
     stickwidth = 4
     limbSeq = np.array([[0, 2], [1, 2], [3, 2], [4, 2]])
-    kps = np.array(kps)
+    kps = np.asarray(kps)
 
     w, h = image_pil.size
-    out_img = np.zeros([h, w, 3])
+    # --- Optimization: Use uint8 dtype directly, avoid float conversions
+    out_img = np.zeros((h, w, 3), dtype=np.uint8)
 
-    for i in range(len(limbSeq)):
-        index = limbSeq[i]
-        color = color_list[index[0]]
+    # --- Optimization: Only one out_img copy, avoid copying in each OpenCV draw call
 
-        x = kps[index][:, 0]
-        y = kps[index][:, 1]
-        length = ((x[0] - x[1]) ** 2 + (y[0] - y[1]) ** 2) ** 0.5
-        angle = math.degrees(math.atan2(y[0] - y[1], x[0] - x[1]))
-        polygon = cv2.ellipse2Poly(
-            (int(np.mean(x)), int(np.mean(y))), (int(length / 2), stickwidth), int(angle), 0, 360, 1
-        )
-        out_img = cv2.fillConvexPoly(out_img.copy(), polygon, color)
-    out_img = (out_img * 0.6).astype(np.uint8)
+    # Draw all limbs in-place
+    for idx0, idx1 in limbSeq:
+        color = color_list[idx0]
+        x0, y0 = kps[idx0]
+        x1, y1 = kps[idx1]
+        out_img = _draw_limb_ellipse(out_img, x0, y0, x1, y1, color, stickwidth)
+    # Blend for translucency
+    # Compute with float32 and re-cast to uint8
+    np.multiply(out_img, 0.6, out=out_img, casting='unsafe', dtype=np.float32)
+    np.clip(out_img, 0, 255, out=out_img)
+    out_img = out_img.astype(np.uint8, copy=False)
 
+    # Draw keypoints (in-place, no need to copy array each time)
     for idx_kp, kp in enumerate(kps):
         color = color_list[idx_kp]
         x, y = kp
-        out_img = cv2.circle(out_img.copy(), (int(x), int(y)), 10, color, -1)
+        cv2.circle(out_img, (int(x), int(y)), 10, color, -1)
 
-    out_img_pil = PIL.Image.fromarray(out_img.astype(np.uint8))
+    # Convert back to PIL.Image
+    out_img_pil = PIL.Image.fromarray(out_img)
     return out_img_pil
 
 
@@ -245,6 +249,24 @@ def retrieve_latents(
         return encoder_output.latents
     else:
         raise AttributeError("Could not access latents of provided encoder_output")
+
+
+def _draw_limb_ellipse(out_img, x0, y0, x1, y1, color, stickwidth):
+    """
+    Fills a polygon representing the limb between (x0,y0) and (x1,y1) using OpenCV.
+    This is a lightweight helper to avoid repetition and repeated np.mean etc.
+    """
+    length = math.hypot(x0 - x1, y0 - y1)
+    if length < 1e-5:
+        return out_img  # avoid drawing zero-length
+    mx = int((x0 + x1) / 2)
+    my = int((y0 + y1) / 2)
+    dx = x0 - x1
+    dy = y0 - y1
+    angle = int(math.degrees(math.atan2(dy, dx)))
+    polygon = cv2.ellipse2Poly((mx, my), (int(length / 2), stickwidth), angle, 0, 360, 1)
+    cv2.fillConvexPoly(out_img, polygon, color)
+    return out_img
 
 
 class ConsisIDPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
