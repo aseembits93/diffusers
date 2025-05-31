@@ -48,34 +48,50 @@ def preprocess_image(image, batch_size):
 
 
 def preprocess_mask(mask, batch_size, scale_factor=8):
+    # If mask is a PIL Image, process as image
     if not isinstance(mask, torch.Tensor):
         mask = mask.convert("L")
         w, h = mask.size
-        w, h = (x - x % 8 for x in (w, h))  # resize to integer multiple of 8
-        mask = mask.resize((w // scale_factor, h // scale_factor), resample=PIL_INTERPOLATION["nearest"])
-        mask = np.array(mask).astype(np.float32) / 255.0
-        mask = np.tile(mask, (4, 1, 1))
-        mask = np.vstack([mask[None]] * batch_size)
-        mask = 1 - mask  # repaint white, keep black
-        mask = torch.from_numpy(mask)
-        return mask
+        w8, h8 = w - w % 8, h - h % 8  # make dimensions multiple of 8
+        # this should be (w8//factor, h8//factor), do not recompute inside tuple
+        shape_out = (w8 // scale_factor, h8 // scale_factor)
+        mask = mask.resize(shape_out, resample=PIL_INTERPOLATION["nearest"])
+        mask_np = np.asarray(mask, dtype=np.float32) / 255.0  # use np.asarray directly
+        mask_np = np.expand_dims(mask_np, axis=0)             # (1, H, W)
+        mask_np = np.repeat(mask_np, 4, axis=0)               # (4, H, W)
+        mask_np = np.broadcast_to(mask_np, (batch_size, 4, *mask_np.shape[1:]))  # (B, 4, H, W)
+        mask_np = 1.0 - mask_np  # repaint white, keep black (in-place faster)
+        mask_tensor = torch.from_numpy(mask_np)
+        return mask_tensor
 
+    # If mask is a torch Tensor process as tensor
+    valid_mask_channel_sizes = [1, 3]
+    if mask.ndim != 4:
+        raise ValueError(f"Mask tensor must have 4 dimensions (got shape {tuple(mask.shape)})")
+    # Only permute if last dim is channel
+    if mask.shape[3] in valid_mask_channel_sizes:
+        mask = mask.permute(0, 3, 1, 2)
+    # If channel not in 2nd position now, error
+    if mask.shape[1] not in valid_mask_channel_sizes:
+        raise ValueError(
+            f"Mask channel dimension of size in {valid_mask_channel_sizes} should be second or fourth dimension,"
+            f" but received mask of shape {tuple(mask.shape)}"
+        )
+    # If mask is 3 channels, average them to 1 for broadcasting
+    if mask.shape[1] == 3:
+        mask = mask.float().mean(dim=1, keepdim=True)
+    elif mask.shape[1] == 1 and mask.dtype != torch.float32:
+        mask = mask.float()
+    # Adjust size to multiple of 8, then interpolate
+    h, w = mask.shape[-2:]
+    h8, w8 = h - h % 8, w - w % 8
+    new_shape = (h8 // scale_factor, w8 // scale_factor)
+    # For efficiency, check if already correct size before interpolating
+    if (h // scale_factor, w // scale_factor) != new_shape:
+        mask = torch.nn.functional.interpolate(mask, new_shape, mode='nearest')
     else:
-        valid_mask_channel_sizes = [1, 3]
-        # if mask channel is fourth tensor dimension, permute dimensions to pytorch standard (B, C, H, W)
-        if mask.shape[3] in valid_mask_channel_sizes:
-            mask = mask.permute(0, 3, 1, 2)
-        elif mask.shape[1] not in valid_mask_channel_sizes:
-            raise ValueError(
-                f"Mask channel dimension of size in {valid_mask_channel_sizes} should be second or fourth dimension,"
-                f" but received mask of shape {tuple(mask.shape)}"
-            )
-        # (potentially) reduce mask channel dimension from 3 to 1 for broadcasting to latent shape
-        mask = mask.mean(dim=1, keepdim=True)
-        h, w = mask.shape[-2:]
-        h, w = (x - x % 8 for x in (h, w))  # resize to integer multiple of 8
-        mask = torch.nn.functional.interpolate(mask, (h // scale_factor, w // scale_factor))
-        return mask
+        mask = torch.nn.functional.interpolate(mask, new_shape)  # Default mode='bilinear'
+    return mask
 
 
 class StableDiffusionInpaintPipelineLegacy(
