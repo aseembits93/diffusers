@@ -133,7 +133,6 @@ class EDMDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
             sigmas = self._compute_exponential_sigmas(ramp)
 
         self.timesteps = self.precondition_noise(sigmas)
-
         self.sigmas = torch.cat([sigmas, torch.zeros(1, device=sigmas.device)])
 
         # setable values
@@ -143,6 +142,9 @@ class EDMDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         self._step_index = None
         self._begin_index = None
         self.sigmas = self.sigmas.to("cpu")  # to avoid too much CPU/GPU communication
+
+        # Pre-create a cached tensor for alpha_t=1 to avoid repeated allocation
+        self._cached_alpha_t = torch.tensor(1)
 
     @property
     def init_noise_sigma(self):
@@ -355,10 +357,9 @@ class EDMDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         return t
 
     def _sigma_to_alpha_sigma_t(self, sigma):
-        alpha_t = torch.tensor(1)  # Inputs are pre-scaled before going into unet, so alpha_t = 1
-        sigma_t = sigma
-
-        return alpha_t, sigma_t
+        # Optimization: Use a cached tensor for alpha_t=1 to avoid redundant allocations
+        # alpha_t always equals 1, so return the cached value
+        return self._cached_alpha_t, sigma
 
     def convert_model_output(
         self,
