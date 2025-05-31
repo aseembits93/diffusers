@@ -521,22 +521,32 @@ class TemporalConvLayer(nn.Module):
         nn.init.zeros_(self.conv4[-1].bias)
 
     def forward(self, hidden_states: torch.Tensor, num_frames: int = 1) -> torch.Tensor:
-        hidden_states = (
-            hidden_states[None, :].reshape((-1, num_frames) + hidden_states.shape[1:]).permute(0, 2, 1, 3, 4)
-        )
+        # Optimized tensor view/permutation to reduce memory usage and allocation
 
-        identity = hidden_states
-        hidden_states = self.conv1(hidden_states)
-        hidden_states = self.conv2(hidden_states)
-        hidden_states = self.conv3(hidden_states)
-        hidden_states = self.conv4(hidden_states)
+        shape = hidden_states.shape
+        B = shape[0]
+        if B % num_frames != 0:
+            raise ValueError("The batch size must be divisible by num_frames.")
 
-        hidden_states = identity + hidden_states
+        N = B // num_frames
+        C = shape[1]
+        H = shape[2]
+        W = shape[3]
 
-        hidden_states = hidden_states.permute(0, 2, 1, 3, 4).reshape(
-            (hidden_states.shape[0] * hidden_states.shape[2], -1) + hidden_states.shape[3:]
-        )
-        return hidden_states
+        # Use .view and .permute only once each direction to minimize expensive ops
+        # (B, C, H, W) => (N, num_frames, C, H, W) => (N, C, num_frames, H, W)
+        hidden_states_3d = hidden_states.view(N, num_frames, C, H, W).permute(0, 2, 1, 3, 4)
+
+        identity = hidden_states_3d
+        out = self.conv1(hidden_states_3d)
+        out = self.conv2(out)
+        out = self.conv3(out)
+        out = self.conv4(out)
+        out = identity + out
+
+        # (N, C, num_frames, H, W) => (N, num_frames, C, H, W) => (B, C, H, W)
+        out = out.permute(0, 2, 1, 3, 4).reshape(B, C, H, W)
+        return out
 
 
 class TemporalResnetBlock(nn.Module):
