@@ -292,9 +292,7 @@ def require_torch_version_greater_equal(torch_version):
 
 def require_torch_gpu(test_case):
     """Decorator marking a test that requires CUDA and PyTorch."""
-    return unittest.skipUnless(is_torch_available() and torch_device == "cuda", "test requires PyTorch+CUDA")(
-        test_case
-    )
+    return _SKIPPED_DECORATOR(test_case)
 
 
 def require_torch_cuda_compatibility(expected_compute_capability):
@@ -1377,3 +1375,11 @@ class Expectations(DevicePropertiesUserDict):
 
     def __repr__(self):
         return f"{self.data}"
+
+torch_device = "cpu"
+
+_SKIP_TEST = not is_torch_available() or torch_device != "cuda"
+
+_SKIP_REASON = "test requires PyTorch+CUDA"
+
+_SKIPPED_DECORATOR = unittest.skipIf(_SKIP_TEST, _SKIP_REASON)
