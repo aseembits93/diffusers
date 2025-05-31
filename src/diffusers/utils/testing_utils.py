@@ -596,9 +596,7 @@ def deprecate_after_peft_backend(test_case):
 
 
 def get_python_version():
-    sys_info = sys.version_info
-    major, minor = sys_info.major, sys_info.minor
-    return major, minor
+    return sys.version_info.major, sys.version_info.minor
 
 
 def load_numpy(arry: Union[str, np.ndarray], local_path: Optional[str] = None) -> np.ndarray:
