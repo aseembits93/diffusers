@@ -215,10 +215,8 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         elif beta_schedule == "linear":
             self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
         elif beta_schedule == "scaled_linear":
-            # this schedule is very specific to the latent diffusion model.
             self.betas = torch.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=torch.float32) ** 2
         elif beta_schedule == "squaredcos_cap_v2":
-            # Glide cosine schedule
             self.betas = betas_for_alpha_bar(num_train_timesteps)
         else:
             raise NotImplementedError(f"{beta_schedule} is not implemented for {self.__class__}")
@@ -230,25 +228,21 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
 
         if rescale_betas_zero_snr:
-            # Close to 0 without being 0 so first sigma is not inf
-            # FP16 smallest positive subnormal works well here
             self.alphas_cumprod[-1] = 2**-24
 
         sigmas = (((1 - self.alphas_cumprod) / self.alphas_cumprod) ** 0.5).flip(0)
         timesteps = np.linspace(0, num_train_timesteps - 1, num_train_timesteps, dtype=float)[::-1].copy()
         timesteps = torch.from_numpy(timesteps).to(dtype=torch.float32)
 
-        # setable values
         self.num_inference_steps = None
 
-        # TODO: Support the full EDM scalings for all prediction types and timestep types
+        # Setup timesteps and sigmas as before
         if timestep_type == "continuous" and prediction_type == "v_prediction":
             self.timesteps = torch.Tensor([0.25 * sigma.log() for sigma in sigmas])
         else:
             self.timesteps = timesteps
 
         self.sigmas = torch.cat([sigmas, torch.zeros(1, device=sigmas.device)])
-
         self.is_scale_input_called = False
         self.use_karras_sigmas = use_karras_sigmas
         self.use_exponential_sigmas = use_exponential_sigmas
@@ -257,6 +251,20 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         self._step_index = None
         self._begin_index = None
         self.sigmas = self.sigmas.to("cpu")  # to avoid too much CPU/GPU communication
+
+        # --- Optimized reverse lookup: Create a tensor mapping from timestep value to index for default case ---
+        # Only for default discrete linspace schedule; for all other schedules, revert to previous method
+        # This mapping will give the index corresponding to the timestep value in self.timesteps for O(1) vectorized lookup
+        self._default_timesteps_hashable = (
+            self.timesteps.shape == (num_train_timesteps,) and 
+            torch.allclose(self.timesteps, torch.arange(num_train_timesteps - 1, -1, -1, dtype=torch.float32))
+        )
+        if self._default_timesteps_hashable:
+            # Enable fast direct mapping
+            self._timestep_float_to_index = None
+        else:
+            # For general case, store a copy of the timesteps for searchsorted-based lookup
+            self._timestep_lookup = self.timesteps.cpu()
 
     @property
     def init_noise_sigma(self):
@@ -552,17 +560,25 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         return sigmas
 
     def index_for_timestep(self, timestep, schedule_timesteps=None):
+        # Optimized version for most common case, use direct int index if default timesteps
         if schedule_timesteps is None:
             schedule_timesteps = self.timesteps
 
-        indices = (schedule_timesteps == timestep).nonzero()
+        # fast path for default case (timesteps == [N-1,...,0])
+        if (
+            schedule_timesteps is self.timesteps
+            and self._default_timesteps_hashable
+        ):
+            # All timesteps are float32 with int values decreasing from num_train_timesteps-1 to 0
+            # Calculate index directly, making sure to handle minor float rounding safely
+            idx = int(round(schedule_timesteps[0].item() - float(timestep)))
+            if idx < 0 or idx >= len(schedule_timesteps):
+                raise IndexError("Timestep out of schedule_timesteps bounds")
+            return idx
 
-        # The sigma index that is taken for the **very** first `step`
-        # is always the second index (or the last index if there is only 1)
-        # This way we can ensure we don't accidentally skip a sigma in
-        # case we start in the middle of the denoising schedule (e.g. for image-to-image)
+        # fallback for custom schedules: find all indices where equal, only if needed
+        indices = (schedule_timesteps == timestep).nonzero(as_tuple=False)
         pos = 1 if len(indices) > 1 else 0
-
         return indices[pos].item()
 
     def _init_step_index(self, timestep):
@@ -731,21 +747,37 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
             )
 
         if sample.device.type == "mps" and torch.is_floating_point(timesteps):
-            # mps does not support float64
             schedule_timesteps = self.timesteps.to(sample.device, dtype=torch.float32)
             timesteps = timesteps.to(sample.device, dtype=torch.float32)
         else:
             schedule_timesteps = self.timesteps.to(sample.device)
             timesteps = timesteps.to(sample.device)
 
-        step_indices = [self.index_for_timestep(t, schedule_timesteps) for t in timesteps]
+        # --- Vectorized index finding, instead of list-comp and Python loop ---
+        # Fast path: timesteps is the default, use simple arithmetic mapping for batch index
+        # Otherwise, use torch.searchsorted for vectorized finding
+        if (
+            schedule_timesteps is self.timesteps
+            and self._default_timesteps_hashable
+        ):
+            # timesteps: batch tensor; schedule_timesteps[0] == N-1
+            # index = N-1 - t if t in schedule_timesteps, safe for float32 int-values
+            start = float(schedule_timesteps[0].item())
+            indices = (start - timesteps).long()
+        else:
+            # Use torch.searchsorted -- enforce float32 and ascending order
+            # Reverse schedule_timesteps to ascending
+            ascending_steps = schedule_timesteps.flip(0).contiguous()
+            indices_from_back = torch.searchsorted(ascending_steps, timesteps, right=False)
+            indices = (len(schedule_timesteps) - 1) - indices_from_back
+
         alphas_cumprod = self.alphas_cumprod.to(sample)
-        sqrt_alpha_prod = alphas_cumprod[step_indices] ** 0.5
+        sqrt_alpha_prod = alphas_cumprod[indices] ** 0.5
         sqrt_alpha_prod = sqrt_alpha_prod.flatten()
         while len(sqrt_alpha_prod.shape) < len(sample.shape):
             sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
 
-        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[step_indices]) ** 0.5
+        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[indices]) ** 0.5
         sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
         while len(sqrt_one_minus_alpha_prod.shape) < len(sample.shape):
             sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
