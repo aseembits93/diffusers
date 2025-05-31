@@ -29,6 +29,7 @@ from ..pipeline_utils import DiffusionPipeline, StableDiffusionMixin
 from .pipeline_output import KolorsPipelineOutput
 from .text_encoder import ChatGLMModel
 from .tokenizer import ChatGLMTokenizer
+from functools import lru_cache
 
 
 if is_torch_xla_available():
@@ -70,7 +71,7 @@ def retrieve_timesteps(
     sigmas: Optional[List[float]] = None,
     **kwargs,
 ):
-    r"""
+    """
     Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
     custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
 
@@ -95,30 +96,48 @@ def retrieve_timesteps(
     """
     if timesteps is not None and sigmas is not None:
         raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
+
+    scheduler_cls = type(scheduler)
+
     if timesteps is not None:
-        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
-        if not accepts_timesteps:
+        params = _get_set_timesteps_params(scheduler_cls)
+        if "timesteps" not in params:
             raise ValueError(
-                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+                f"The current scheduler class {scheduler_cls}'s `set_timesteps` does not support custom"
                 f" timestep schedules. Please check whether you are using the correct scheduler."
             )
         scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
+        timesteps_result = scheduler.timesteps
+        num_inference_steps = len(timesteps_result)
     elif sigmas is not None:
-        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
-        if not accept_sigmas:
+        params = _get_set_timesteps_params(scheduler_cls)
+        if "sigmas" not in params:
             raise ValueError(
-                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+                f"The current scheduler class {scheduler_cls}'s `set_timesteps` does not support custom"
                 f" sigmas schedules. Please check whether you are using the correct scheduler."
             )
         scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
+        timesteps_result = scheduler.timesteps
+        num_inference_steps = len(timesteps_result)
     else:
         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-    return timesteps, num_inference_steps
+        timesteps_result = scheduler.timesteps
+    return timesteps_result, num_inference_steps
+
+# Optimization note:
+# - Profile shows that `inspect.signature(scheduler.set_timesteps)` is very expensive and repeated.
+# - We'll cache which parameters each scheduler.set_timesteps supports, by class (type).
+# - This approach minimizes repeated reflection.
+# - The new helper function _get_set_timesteps_params ensures runtime and memory are minimized in hot path.
+
+
+@lru_cache(maxsize=32)
+def _get_set_timesteps_params(scheduler_cls):
+    """
+    Helper to inspect scheduler.set_timesteps, returning a set of parameter names.
+    Uses LRU cache to speed up repeated calls for same class.
+    """
+    return set(inspect.signature(scheduler_cls.set_timesteps).parameters.keys())
 
 
 class KolorsPipeline(DiffusionPipeline, StableDiffusionMixin, StableDiffusionLoraLoaderMixin, IPAdapterMixin):
