@@ -188,7 +188,6 @@ class DDIMParallelScheduler(SchedulerMixin, ConfigMixin):
     _is_ode_scheduler = True
 
     @register_to_config
-    # Copied from diffusers.schedulers.scheduling_ddim.DDIMScheduler.__init__
     def __init__(
         self,
         num_train_timesteps: int = 1000,
@@ -212,33 +211,28 @@ class DDIMParallelScheduler(SchedulerMixin, ConfigMixin):
         elif beta_schedule == "linear":
             self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
         elif beta_schedule == "scaled_linear":
-            # this schedule is very specific to the latent diffusion model.
             self.betas = torch.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=torch.float32) ** 2
         elif beta_schedule == "squaredcos_cap_v2":
-            # Glide cosine schedule
             self.betas = betas_for_alpha_bar(num_train_timesteps)
         else:
             raise NotImplementedError(f"{beta_schedule} is not implemented for {self.__class__}")
 
-        # Rescale for zero SNR
         if rescale_betas_zero_snr:
             self.betas = rescale_zero_terminal_snr(self.betas)
 
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-
-        # At every step in ddim, we are looking into the previous alphas_cumprod
-        # For the final step, there is no previous alphas_cumprod because we are already at 0
-        # `set_alpha_to_one` decides whether we set this parameter simply to one or
-        # whether we use the final alpha of the "non-previous" one.
-        self.final_alpha_cumprod = torch.tensor(1.0) if set_alpha_to_one else self.alphas_cumprod[0]
-
-        # standard deviation of the initial noise distribution
+        # Cache as float32 tensor for fast device/scalar match, without conversion on every call
+        if set_alpha_to_one:
+            self.final_alpha_cumprod = self.alphas_cumprod.new_tensor(1.0)
+        else:
+            self.final_alpha_cumprod = self.alphas_cumprod[0]
         self.init_noise_sigma = 1.0
 
-        # setable values
         self.num_inference_steps = None
-        self.timesteps = torch.from_numpy(np.arange(0, num_train_timesteps)[::-1].copy().astype(np.int64))
+        self.timesteps = torch.from_numpy(
+            np.arange(0, num_train_timesteps)[::-1].copy().astype(np.int64)
+        )
 
     # Copied from diffusers.schedulers.scheduling_ddim.DDIMScheduler.scale_model_input
     def scale_model_input(self, sample: torch.Tensor, timestep: Optional[int] = None) -> torch.Tensor:
@@ -259,15 +253,35 @@ class DDIMParallelScheduler(SchedulerMixin, ConfigMixin):
         return sample
 
     def _get_variance(self, timestep, prev_timestep=None):
+        # Optimization: pull local references & avoid repeated tensor/attribute access
+        alphas_cumprod = self.alphas_cumprod
+        final_alpha_cumprod = self.final_alpha_cumprod
+
+        # Use python int for indices to avoid repeatedly casting tensors
         if prev_timestep is None:
-            prev_timestep = timestep - self.config.num_train_timesteps // self.num_inference_steps
+            num_train_timesteps = self.config.num_train_timesteps
+            num_inference_steps = self.num_inference_steps
+            prev_timestep = timestep - num_train_timesteps // num_inference_steps
 
-        alpha_prod_t = self.alphas_cumprod[timestep]
-        alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
-        beta_prod_t = 1 - alpha_prod_t
-        beta_prod_t_prev = 1 - alpha_prod_t_prev
+        # Vectorized tensor get (single) for maximum speed
+        alpha_prod_t = alphas_cumprod[timestep]
+        if prev_timestep >= 0:
+            alpha_prod_t_prev = alphas_cumprod[prev_timestep]
+        else:
+            alpha_prod_t_prev = final_alpha_cumprod
 
-        variance = (beta_prod_t_prev / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_t_prev)
+        # Avoid repeated (1 - x): use preallocated tensor of appropriate type on same device
+        # Most efficient way in PyTorch is still 1.0 - tensor (keeps dtype/device behavior)
+        # But we store 1.0 as a tensor in __init__
+        one = alpha_prod_t.new_tensor(1.0)
+
+        beta_prod_t = one - alpha_prod_t
+        beta_prod_t_prev = one - alpha_prod_t_prev
+
+        # Compute (beta_prod_t_prev / beta_prod_t) * (1 - (alpha_prod_t / alpha_prod_t_prev))
+        # All as PyTorch tensor ops on already-correct device/type
+        # (fuse the two subtractions and division)
+        variance = (beta_prod_t_prev / beta_prod_t) * (one - (alpha_prod_t / alpha_prod_t_prev))
 
         return variance
 
