@@ -469,7 +469,7 @@ def require_peft_backend(test_case):
     Decorator marking a test that requires PEFT backend, this would require some specific versions of PEFT and
     transformers.
     """
-    return unittest.skipUnless(USE_PEFT_BACKEND, "test requires PEFT backend")(test_case)
+    return _peft_backend_skip(test_case)
 
 
 def require_timm(test_case):
@@ -1377,3 +1377,8 @@ class Expectations(DevicePropertiesUserDict):
 
     def __repr__(self):
         return f"{self.data}"
+
+_peft_backend_skip = unittest.skipUnless(
+    USE_PEFT_BACKEND,
+    "test requires PEFT backend"
+)
