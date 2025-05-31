@@ -106,7 +106,7 @@ class EDMDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         solver_type: str = "midpoint",
         lower_order_final: bool = True,
         euler_at_final: bool = False,
-        final_sigmas_type: Optional[str] = "zero",  # "zero", "sigma_min"
+        final_sigmas_type: Optional[str] = "zero",
     ):
         # settings for DPM-Solver
         if algorithm_type not in ["dpmsolver++", "sde-dpmsolver++"]:
@@ -126,23 +126,25 @@ class EDMDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
                 f"`final_sigmas_type` {final_sigmas_type} is not supported for `algorithm_type` {algorithm_type}. Please choose `sigma_min` instead."
             )
 
+        # Use only torch; preallocate buffers
         ramp = torch.linspace(0, 1, num_train_timesteps)
         if sigma_schedule == "karras":
             sigmas = self._compute_karras_sigmas(ramp)
         elif sigma_schedule == "exponential":
             sigmas = self._compute_exponential_sigmas(ramp)
+        else:
+            raise NotImplementedError(f"Unknown sigma_schedule: {sigma_schedule}")
 
         self.timesteps = self.precondition_noise(sigmas)
-
         self.sigmas = torch.cat([sigmas, torch.zeros(1, device=sigmas.device)])
 
-        # setable values
+        # Pre-allocate and set values, keep everything on cpu by default to avoid repeated device transfers
         self.num_inference_steps = None
         self.model_outputs = [None] * solver_order
         self.lower_order_nums = 0
         self._step_index = None
         self._begin_index = None
-        self.sigmas = self.sigmas.to("cpu")  # to avoid too much CPU/GPU communication
+        self.sigmas = self.sigmas.cpu()
 
     @property
     def init_noise_sigma(self):
@@ -308,27 +310,42 @@ class EDMDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         https://arxiv.org/abs/2205.11487
         """
         dtype = sample.dtype
-        batch_size, channels, *remaining_dims = sample.shape
+        shape = sample.shape
+        batch_size, channels = shape[0], shape[1]
+        remaining = shape[2:]
 
+        # Only use PyTorch ops for shape math, for speed and less memory churn
+        numrest = 1
+        for d in remaining:
+            numrest *= d
+
+        # Quantile and clamping best performed in float32 or float64
         if dtype not in (torch.float32, torch.float64):
-            sample = sample.float()  # upcast for quantile calculation, and clamp not implemented for cpu half
+            sample = sample.to(torch.float32)
 
-        # Flatten sample for doing quantile calculation along each image
-        sample = sample.reshape(batch_size, channels * np.prod(remaining_dims))
+        # [B, C, ...] -> [B, C * ...]
+        sample_flat = sample.reshape(batch_size, channels * numrest)
+        abs_sample = sample_flat.abs()
 
-        abs_sample = sample.abs()  # "a certain percentile absolute pixel value"
-
-        s = torch.quantile(abs_sample, self.config.dynamic_thresholding_ratio, dim=1)
+        # Compute the quantile s for each image (batch dim 0)
+        s = torch.quantile(
+            abs_sample,
+            self.config.dynamic_thresholding_ratio,
+            dim=1,
+        )
         s = torch.clamp(
-            s, min=1, max=self.config.sample_max_value
-        )  # When clamped to min=1, equivalent to standard clipping to [-1, 1]
-        s = s.unsqueeze(1)  # (batch_size, 1) because clamp will broadcast along dim=0
-        sample = torch.clamp(sample, -s, s) / s  # "we threshold xt0 to the range [-s, s] and then divide by s"
+            s, min=1.0, max=self.config.sample_max_value
+        )
+        s = s.view(batch_size, 1)  # Prepare for broadcasting
 
-        sample = sample.reshape(batch_size, channels, *remaining_dims)
-        sample = sample.to(dtype)
+        # Apply threshold and normalization in-place where possible
+        clamped = torch.clamp(sample_flat, -s, s) / s
 
-        return sample
+        # Reshape back, finally cast back to original dtype only if needed
+        clamped = clamped.view(*shape)
+        if clamped.dtype != dtype:
+            clamped = clamped.to(dtype)
+        return clamped
 
     # Copied from diffusers.schedulers.scheduling_euler_discrete.EulerDiscreteScheduler._sigma_to_t
     def _sigma_to_t(self, sigma, log_sigmas):
