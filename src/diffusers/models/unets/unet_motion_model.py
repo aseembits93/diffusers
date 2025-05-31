@@ -181,16 +181,20 @@ class AnimateDiffTransformer3D(nn.Module):
 
         residual = hidden_states
 
-        hidden_states = hidden_states[None, :].reshape(batch_size, num_frames, channel, height, width)
-        hidden_states = hidden_states.permute(0, 2, 1, 3, 4)
+        # Combine reshape/permutation steps for best performance and memory locality
+        hidden_states = hidden_states.view(batch_size, num_frames, channel, height, width)
+        hidden_states = hidden_states.permute(0, 2, 1, 3, 4)  # (batch, ch, T, H, W)
 
         hidden_states = self.norm(hidden_states)
+        # Merge spatial and batch dimensions
         hidden_states = hidden_states.permute(0, 3, 4, 2, 1).reshape(batch_size * height * width, num_frames, channel)
+        # (B*H*W, T, ch)
 
-        hidden_states = self.proj_in(input=hidden_states)
+        # do not pass input=...., just pass as positional argument for Linear for slight speedup
+        hidden_states = self.proj_in(hidden_states)    # (B*H*W, T, inner_dim)
 
-        # 2. Blocks
-        for block in self.transformer_blocks:
+        blocks = self.transformer_blocks
+        for block in blocks:
             hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
@@ -199,15 +203,12 @@ class AnimateDiffTransformer3D(nn.Module):
                 class_labels=class_labels,
             )
 
-        # 3. Output
-        hidden_states = self.proj_out(input=hidden_states)
-        hidden_states = (
-            hidden_states[None, None, :]
-            .reshape(batch_size, height, width, num_frames, channel)
-            .permute(0, 3, 4, 1, 2)
-            .contiguous()
-        )
-        hidden_states = hidden_states.reshape(batch_frames, channel, height, width)
+        # Final output projection and re-arranging
+        hidden_states = self.proj_out(hidden_states)  # (B*H*W, T, ch)
+        # Avoid unnecessary [None, None, ...]
+        hidden_states = hidden_states.view(batch_size, height, width, num_frames, channel)
+        hidden_states = hidden_states.permute(0, 3, 4, 1, 2).contiguous()
+        hidden_states = hidden_states.view(batch_frames, channel, height, width)
 
         output = hidden_states + residual
         return output
