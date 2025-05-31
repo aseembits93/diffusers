@@ -104,22 +104,19 @@ def rescale_zero_terminal_snr(alphas_cumprod):
     Returns:
         `torch.Tensor`: rescaled betas with zero terminal SNR
     """
+    # Optimize: avoid unnecessary .clone(), fuse steps to reduce Python interpreter overhead,
+    # use in-place ops when safe
 
     alphas_bar_sqrt = alphas_cumprod.sqrt()
+    alphas_bar_sqrt_0 = alphas_bar_sqrt[0]
+    alphas_bar_sqrt_T = alphas_bar_sqrt[-1]
 
-    # Store old values.
-    alphas_bar_sqrt_0 = alphas_bar_sqrt[0].clone()
-    alphas_bar_sqrt_T = alphas_bar_sqrt[-1].clone()
+    scale = alphas_bar_sqrt_0 / (alphas_bar_sqrt_0 - alphas_bar_sqrt_T)
+    # Combine all in-place operations to a single fused calculation
+    alphas_bar_sqrt = (alphas_bar_sqrt - alphas_bar_sqrt_T) * scale
 
-    # Shift so the last timestep is zero.
-    alphas_bar_sqrt -= alphas_bar_sqrt_T
-
-    # Scale so the first timestep is back to the old value.
-    alphas_bar_sqrt *= alphas_bar_sqrt_0 / (alphas_bar_sqrt_0 - alphas_bar_sqrt_T)
-
-    # Convert alphas_bar_sqrt to betas
-    alphas_bar = alphas_bar_sqrt**2  # Revert sqrt
-
+    # Revert sqrt
+    alphas_bar = alphas_bar_sqrt * alphas_bar_sqrt
     return alphas_bar
 
 
