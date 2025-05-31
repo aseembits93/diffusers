@@ -238,7 +238,12 @@ class DDIMParallelScheduler(SchedulerMixin, ConfigMixin):
 
         # setable values
         self.num_inference_steps = None
-        self.timesteps = torch.from_numpy(np.arange(0, num_train_timesteps)[::-1].copy().astype(np.int64))
+        # The [::-1] can be np.arange(num_train_timesteps-1, -1, -1) for more direct int64 type and less copy/astype
+        self.timesteps = torch.arange(num_train_timesteps - 1, -1, -1, dtype=torch.long)
+
+        # Precompute sqrt(alpha_cumprod) and sqrt(1-alpha_cumprod); will be sent to device/dtype as needed
+        self._sqrt_alphas_cumprod = self.alphas_cumprod.sqrt()
+        self._sqrt_one_minus_alphas_cumprod = (1 - self.alphas_cumprod).sqrt()
 
     # Copied from diffusers.schedulers.scheduling_ddim.DDIMScheduler.scale_model_input
     def scale_model_input(self, sample: torch.Tensor, timestep: Optional[int] = None) -> torch.Tensor:
@@ -602,25 +607,25 @@ class DDIMParallelScheduler(SchedulerMixin, ConfigMixin):
         noise: torch.Tensor,
         timesteps: torch.IntTensor,
     ) -> torch.Tensor:
-        # Make sure alphas_cumprod and timestep have same device and dtype as original_samples
-        # Move the self.alphas_cumprod to device to avoid redundant CPU to GPU data movement
-        # for the subsequent add_noise calls
-        self.alphas_cumprod = self.alphas_cumprod.to(device=original_samples.device)
-        alphas_cumprod = self.alphas_cumprod.to(dtype=original_samples.dtype)
-        timesteps = timesteps.to(original_samples.device)
+        # Precompute and cache sqrt_alpha_prod and sqrt_one_minus_alpha_prod on init,
+        # move to target device/dtype only once for the full batch
 
-        sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
-        sqrt_alpha_prod = sqrt_alpha_prod.flatten()
-        while len(sqrt_alpha_prod.shape) < len(original_samples.shape):
+        # Ensure compatibility
+        device = original_samples.device
+        dtype = original_samples.dtype
+        # Use local variables for device/dtype conversion
+        sqrt_alpha_prod = self._sqrt_alphas_cumprod.to(device=device, dtype=dtype)[timesteps]
+        sqrt_one_minus_alpha_prod = self._sqrt_one_minus_alphas_cumprod.to(device=device, dtype=dtype)[timesteps]
+
+        # Use broadcasting instead of expanding via unsqueeze in a loop
+        sample_shape = original_samples.shape
+        while sqrt_alpha_prod.ndim < len(sample_shape):
             sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
-
-        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
-        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
-        while len(sqrt_one_minus_alpha_prod.shape) < len(original_samples.shape):
+        while sqrt_one_minus_alpha_prod.ndim < len(sample_shape):
             sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
 
-        noisy_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
-        return noisy_samples
+        # Directly compute result
+        return sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
 
     # Copied from diffusers.schedulers.scheduling_ddpm.DDPMScheduler.get_velocity
     def get_velocity(self, sample: torch.Tensor, noise: torch.Tensor, timesteps: torch.IntTensor) -> torch.Tensor:
