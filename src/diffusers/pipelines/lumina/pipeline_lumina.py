@@ -39,6 +39,7 @@ from ...utils import (
 )
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline, ImagePipelineOutput
+from functools import lru_cache
 
 
 if is_torch_xla_available():
@@ -82,7 +83,7 @@ def retrieve_timesteps(
     sigmas: Optional[List[float]] = None,
     **kwargs,
 ):
-    r"""
+    """
     Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
     custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
 
@@ -108,8 +109,8 @@ def retrieve_timesteps(
     if timesteps is not None and sigmas is not None:
         raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
     if timesteps is not None:
-        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
-        if not accepts_timesteps:
+        # Use cached check for timesteps support.
+        if not _scheduler_accepts_timesteps(type(scheduler)):
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
                 f" timestep schedules. Please check whether you are using the correct scheduler."
@@ -118,8 +119,8 @@ def retrieve_timesteps(
         timesteps = scheduler.timesteps
         num_inference_steps = len(timesteps)
     elif sigmas is not None:
-        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
-        if not accept_sigmas:
+        # Use cached check for sigmas support.
+        if not _scheduler_accepts_sigmas(type(scheduler)):
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
                 f" sigmas schedules. Please check whether you are using the correct scheduler."
@@ -131,6 +132,16 @@ def retrieve_timesteps(
         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
         timesteps = scheduler.timesteps
     return timesteps, num_inference_steps
+
+
+# Helper functions to cache signature checks per scheduler type for faster lookup
+@lru_cache(maxsize=32)
+def _scheduler_accepts_timesteps(scheduler_class):
+    return "timesteps" in inspect.signature(scheduler_class.set_timesteps).parameters
+
+@lru_cache(maxsize=32)
+def _scheduler_accepts_sigmas(scheduler_class):
+    return "sigmas" in inspect.signature(scheduler_class.set_timesteps).parameters
 
 
 class LuminaPipeline(DiffusionPipeline):
