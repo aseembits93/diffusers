@@ -217,18 +217,19 @@ class CogVideoXDDIMScheduler(SchedulerMixin, ConfigMixin):
         if rescale_betas_zero_snr:
             self.alphas_cumprod = rescale_zero_terminal_snr(self.alphas_cumprod)
 
-        # At every step in ddim, we are looking into the previous alphas_cumprod
-        # For the final step, there is no previous alphas_cumprod because we are already at 0
-        # `set_alpha_to_one` decides whether we set this parameter simply to one or
-        # whether we use the final alpha of the "non-previous" one.
         self.final_alpha_cumprod = torch.tensor(1.0) if set_alpha_to_one else self.alphas_cumprod[0]
 
-        # standard deviation of the initial noise distribution
         self.init_noise_sigma = 1.0
 
-        # setable values
         self.num_inference_steps = None
         self.timesteps = torch.from_numpy(np.arange(0, num_train_timesteps)[::-1].copy().astype(np.int64))
+
+        # Precompute square roots for all alphas_cumprod values (on CPU, float32 by default)
+        # These will be moved to correct dtype/device only when required
+        self._sqrt_alphas_cumprod_cpu = self.alphas_cumprod.sqrt().float().cpu()
+        self._sqrt_one_minus_alphas_cumprod_cpu = (1 - self.alphas_cumprod).sqrt().float().cpu()
+        # Dict cache for precomputed tensors: {(device, dtype): (sqrt_a, sqrt_1ma)}
+        self._sqrt_cache = {}
 
     def _get_variance(self, timestep, prev_timestep):
         alpha_prod_t = self.alphas_cumprod[timestep]
@@ -408,22 +409,23 @@ class CogVideoXDDIMScheduler(SchedulerMixin, ConfigMixin):
         noise: torch.Tensor,
         timesteps: torch.IntTensor,
     ) -> torch.Tensor:
-        # Make sure alphas_cumprod and timestep have same device and dtype as original_samples
-        # Move the self.alphas_cumprod to device to avoid redundant CPU to GPU data movement
-        # for the subsequent add_noise calls
-        self.alphas_cumprod = self.alphas_cumprod.to(device=original_samples.device)
-        alphas_cumprod = self.alphas_cumprod.to(dtype=original_samples.dtype)
-        timesteps = timesteps.to(original_samples.device)
+        device = original_samples.device
+        dtype = original_samples.dtype
 
-        sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
-        sqrt_alpha_prod = sqrt_alpha_prod.flatten()
-        while len(sqrt_alpha_prod.shape) < len(original_samples.shape):
-            sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
+        cache_key = (device, dtype)
+        if cache_key not in self._sqrt_cache:
+            # Move precomputed sqrt arrays to target device/dtype as needed
+            sqrt_alphas_cumprod = self._sqrt_alphas_cumprod_cpu.to(device=device, dtype=dtype)
+            sqrt_one_minus_alphas_cumprod = self._sqrt_one_minus_alphas_cumprod_cpu.to(device=device, dtype=dtype)
+            self._sqrt_cache[cache_key] = (sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod)
+        else:
+            sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod = self._sqrt_cache[cache_key]
 
-        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
-        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
-        while len(sqrt_one_minus_alpha_prod.shape) < len(original_samples.shape):
-            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+        timesteps = timesteps.to(device=device)
+        # Broadcast over sample dims: select and view for broadcasting in batch
+        shape = (-1,) + (1,) * (original_samples.dim() - 1)
+        sqrt_alpha_prod = sqrt_alphas_cumprod[timesteps].view(shape)
+        sqrt_one_minus_alpha_prod = sqrt_one_minus_alphas_cumprod[timesteps].view(shape)
 
         noisy_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
         return noisy_samples
