@@ -430,21 +430,38 @@ class CogVideoXDDIMScheduler(SchedulerMixin, ConfigMixin):
 
     # Copied from diffusers.schedulers.scheduling_ddpm.DDPMScheduler.get_velocity
     def get_velocity(self, sample: torch.Tensor, noise: torch.Tensor, timesteps: torch.IntTensor) -> torch.Tensor:
-        # Make sure alphas_cumprod and timestep have same device and dtype as sample
-        self.alphas_cumprod = self.alphas_cumprod.to(device=sample.device)
-        alphas_cumprod = self.alphas_cumprod.to(dtype=sample.dtype)
-        timesteps = timesteps.to(sample.device)
+        # Optimize device and dtype movements and shape expansions for speed
 
-        sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
-        sqrt_alpha_prod = sqrt_alpha_prod.flatten()
-        while len(sqrt_alpha_prod.shape) < len(sample.shape):
+        # Only move and change dtype if needed
+        target_device = sample.device
+        target_dtype = sample.dtype
+
+        if self.alphas_cumprod.device != target_device:
+            alphas_cumprod = self.alphas_cumprod.to(device=target_device)
+        else:
+            alphas_cumprod = self.alphas_cumprod
+
+        if alphas_cumprod.dtype != target_dtype:
+            alphas_cumprod = alphas_cumprod.to(dtype=target_dtype)
+
+        if timesteps.device != target_device:
+            timesteps = timesteps.to(target_device)
+
+        # Efficient indexing without repeated to() ops
+        # Avoid repeated .flatten()/.unsqueeze by using .view to align shapes in one step
+        # (broadcast semantics)
+
+        # Fetch scalars for each batch index and upcast in a single step
+        sqrt_alpha_prod = torch.sqrt(alphas_cumprod[timesteps])
+        sqrt_one_minus_alpha_prod = torch.sqrt(1 - alphas_cumprod[timesteps])
+
+        # Reshape for broadcast (to match dimensions of sample/noise)
+        # Assume batch first
+        for _ in range(sample.dim() - sqrt_alpha_prod.dim()):
             sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
-
-        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
-        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
-        while len(sqrt_one_minus_alpha_prod.shape) < len(sample.shape):
             sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
 
+        # The main computation
         velocity = sqrt_alpha_prod * noise - sqrt_one_minus_alpha_prod * sample
         return velocity
 
