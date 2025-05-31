@@ -59,11 +59,19 @@ class MochiChunkedGroupNorm3D(nn.Module):
 
     def forward(self, x: torch.Tensor = None) -> torch.Tensor:
         batch_size = x.size(0)
+        # x: (B, F, C, H, W)
+        # rearrange to (B, F, C, H, W) -> (B, C, F, H, W) -> flatten(0, 1): (B*C, F, H, W)
+        x_permuted = x.permute(0, 2, 1, 3, 4).flatten(0, 1)
+        N = x_permuted.size(0)
+        output = torch.empty_like(x_permuted)
 
-        x = x.permute(0, 2, 1, 3, 4).flatten(0, 1)
-        output = torch.cat([self.norm_layer(chunk) for chunk in x.split(self.chunk_size, dim=0)], dim=0)
+        # Efficient chunked processing
+        for start in range(0, N, self.chunk_size):
+            end = min(start + self.chunk_size, N)
+            output[start:end] = self.norm_layer(x_permuted[start:end])
+
+        # Converts back to (B, F, C, H, W)
         output = output.unflatten(0, (batch_size, -1)).permute(0, 2, 1, 3, 4)
-
         return output
 
 
