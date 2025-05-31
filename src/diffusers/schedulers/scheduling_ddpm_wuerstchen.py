@@ -65,23 +65,29 @@ def betas_for_alpha_bar(
         betas (`np.ndarray`): the betas used by the scheduler to step the model outputs
     """
     if alpha_transform_type == "cosine":
-
         def alpha_bar_fn(t):
             return math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2
 
     elif alpha_transform_type == "exp":
-
         def alpha_bar_fn(t):
             return math.exp(t * -12.0)
 
     else:
         raise ValueError(f"Unsupported alpha_transform_type: {alpha_transform_type}")
 
+    # Fast path: cache t1 and alpha_bar_fn(t1)
     betas = []
-    for i in range(num_diffusion_timesteps):
-        t1 = i / num_diffusion_timesteps
-        t2 = (i + 1) / num_diffusion_timesteps
-        betas.append(min(1 - alpha_bar_fn(t2) / alpha_bar_fn(t1), max_beta))
+    n = num_diffusion_timesteps
+    t1 = 0.0
+    alpha_bar_t1 = alpha_bar_fn(t1)
+    for i in range(n):
+        t2 = (i + 1) / n
+        alpha_bar_t2 = alpha_bar_fn(t2)
+        val = min(1 - alpha_bar_t2 / alpha_bar_t1, max_beta)
+        betas.append(val)
+        # Prepare for next iter
+        t1 = t2
+        alpha_bar_t1 = alpha_bar_t2
     return torch.tensor(betas, dtype=torch.float32)
 
 
