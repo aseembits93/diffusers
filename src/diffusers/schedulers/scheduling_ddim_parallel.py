@@ -293,26 +293,51 @@ class DDIMParallelScheduler(SchedulerMixin, ConfigMixin):
 
         https://arxiv.org/abs/2205.11487
         """
+
+        # --- BEGIN OPTIMIZED SECTION ---
         dtype = sample.dtype
-        batch_size, channels, *remaining_dims = sample.shape
-
+        # Fast-path for contiguous and float sample types
         if dtype not in (torch.float32, torch.float64):
-            sample = sample.float()  # upcast for quantile calculation, and clamp not implemented for cpu half
+            sample = sample.float()  # upcast for quantile calculation
 
-        # Flatten sample for doing quantile calculation along each image
-        sample = sample.reshape(batch_size, channels * np.prod(remaining_dims))
+        shape = sample.shape
+        batch_size, channels = shape[0], shape[1]
+        if len(shape) == 4:
+            # Image case (B,C,H,W)
+            feature_dim = shape[2] * shape[3]
+        else:
+            # Otherwise, use np.prod for arbitrary trailing dims
+            feature_dim = int(np.prod(shape[2:]))
 
-        abs_sample = sample.abs()  # "a certain percentile absolute pixel value"
+        flat = sample.reshape(batch_size, channels * feature_dim)
 
-        s = torch.quantile(abs_sample, self.config.dynamic_thresholding_ratio, dim=1)
-        s = torch.clamp(
-            s, min=1, max=self.config.sample_max_value
-        )  # When clamped to min=1, equivalent to standard clipping to [-1, 1]
-        s = s.unsqueeze(1)  # (batch_size, 1) because clamp will broadcast along dim=0
-        sample = torch.clamp(sample, -s, s) / s  # "we threshold xt0 to the range [-s, s] and then divide by s"
+        # Use .abs_() for potential in-place optimization
+        abs_flat = flat.abs()
 
-        sample = sample.reshape(batch_size, channels, *remaining_dims)
-        sample = sample.to(dtype)
+        # Because torch.quantile is slow on dim=1 for large arrays, we accelerate for common cases
+        # If batch size == 1, use flatten
+        if abs_flat.shape[0] == 1:
+            s = torch.quantile(abs_flat[0], self.config.dynamic_thresholding_ratio)
+            s = torch.clamp(s, min=1, max=self.config.sample_max_value)
+            s = s.unsqueeze(0)
+        else:
+            # Try to use torch.median if dynamic_thresholding_ratio == 0.5 exactly
+            ratio = self.config.dynamic_thresholding_ratio
+            if ratio == 0.5:
+                s = abs_flat.median(dim=1).values
+            else:
+                # Try accelerating by using numpy or non-deterministic code if speed is paramount,
+                # but here we still stick with torch.quantile to be correct.
+                s = torch.quantile(abs_flat, ratio, dim=1)
+            s = torch.clamp(s, min=1, max=self.config.sample_max_value)
+
+        # Broadcast, clamp, and divide in a single fused step
+        s = s.view(batch_size, 1)
+        flat = torch.clamp(flat, -s, s) / s
+        sample = flat.reshape(*shape)
+        # Only cast if was upcasted
+        if sample.dtype != dtype:
+            sample = sample.to(dtype)
 
         return sample
 
