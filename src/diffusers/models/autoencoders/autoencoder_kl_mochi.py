@@ -409,30 +409,48 @@ class MochiUpBlock3D(nn.Module):
 class FourierFeatures(nn.Module):
     def __init__(self, start: int = 6, stop: int = 8, step: int = 1):
         super().__init__()
-
         self.start = start
         self.stop = stop
         self.step = step
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        r"""Forward method of the `FourierFeatures` class."""
+        """Forward method of the `FourierFeatures` class."""
         original_dtype = inputs.dtype
-        inputs = inputs.to(torch.float32)
-        num_channels = inputs.shape[1]
+        # Only cast if needed; avoid unnecessary copy if already float32
+        if inputs.dtype != torch.float32:
+            inputs_fp32 = inputs.to(torch.float32)
+        else:
+            inputs_fp32 = inputs
+
+        num_channels = inputs_fp32.shape[1]
         num_freqs = (self.stop - self.start) // self.step
 
-        freqs = torch.arange(self.start, self.stop, self.step, dtype=inputs.dtype, device=inputs.device)
+        # Allocate [num_freqs], [num_channels]; then broadcast
+        freqs = torch.arange(self.start, self.stop, self.step, device=inputs_fp32.device, dtype=inputs_fp32.dtype)  # [num_freqs]
         w = torch.pow(2.0, freqs) * (2 * torch.pi)  # [num_freqs]
-        w = w.repeat(num_channels)[None, :, None, None, None]  # [1, num_channels * num_freqs, 1, 1, 1]
 
-        # Interleaved repeat of input channels to match w
-        h = inputs.repeat_interleave(
-            num_freqs, dim=1, output_size=inputs.shape[1] * num_freqs
-        )  # [B, C * num_freqs, T, H, W]
-        # Scale channels by frequency.
-        h = w * h
+        # Prepare shape for per-channel frequencies: [1, C, num_freqs, 1, 1, 1]
+        w = w.view(1, 1, num_freqs, 1, 1, 1)
+        # inputs [B, C, T, H, W] => [B, C, 1, T, H, W], for broadcasting multiply
+        h = inputs_fp32.unsqueeze(2)  # [B, C, 1, T, H, W]
+        # h * w, broadcasting freq per channel
+        hw = h * w  # [B, C, num_freqs, T, H, W]
 
-        return torch.cat([inputs, torch.sin(h), torch.cos(h)], dim=1).to(original_dtype)
+        # Reshape to [B, C*num_freqs, T, H, W] for concatenation
+        B, C, F, T, H, W = hw.shape
+        hw = hw.reshape(B, C*F, T, H, W)
+
+        # Concatenate the input, sin and cos features
+        out = torch.cat([
+            inputs_fp32,
+            torch.sin(hw),
+            torch.cos(hw)
+        ], dim=1)
+
+        # Cast back only if necessary
+        if out.dtype != original_dtype:
+            out = out.to(original_dtype)
+        return out
 
 
 class MochiEncoder3D(nn.Module):
