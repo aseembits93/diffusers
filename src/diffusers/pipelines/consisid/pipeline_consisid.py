@@ -156,20 +156,23 @@ def get_resize_crop_region_for_grid(src, tgt_width, tgt_height):
         2. The bottom-right coordinates of the crop region.
     """
 
-    tw = tgt_width
-    th = tgt_height
     h, w = src
     r = h / w
-    if r > (th / tw):
-        resize_height = th
-        resize_width = int(round(th / h * w))
+    target_ratio = tgt_height / tgt_width
+
+    if r > target_ratio:
+        # Limited by height; base scaling on tgt_height
+        scale = tgt_height / h
+        resize_height = tgt_height
+        resize_width = int(round(w * scale))
     else:
-        resize_width = tw
-        resize_height = int(round(tw / w * h))
+        # Limited by width; base scaling on tgt_width
+        scale = tgt_width / w
+        resize_width = tgt_width
+        resize_height = int(round(h * scale))
 
-    crop_top = int(round((th - resize_height) / 2.0))
-    crop_left = int(round((tw - resize_width) / 2.0))
-
+    crop_top = round((tgt_height - resize_height) / 2)
+    crop_left = round((tgt_width - resize_width) / 2)
     return (crop_top, crop_left), (crop_top + resize_height, crop_left + resize_width)
 
 
