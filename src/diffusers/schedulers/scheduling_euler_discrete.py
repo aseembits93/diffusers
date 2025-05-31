@@ -108,28 +108,26 @@ def rescale_zero_terminal_snr(betas):
     Returns:
         `torch.Tensor`: rescaled betas with zero terminal SNR
     """
-    # Convert betas to alphas_bar_sqrt
     alphas = 1.0 - betas
     alphas_cumprod = torch.cumprod(alphas, dim=0)
     alphas_bar_sqrt = alphas_cumprod.sqrt()
 
-    # Store old values.
-    alphas_bar_sqrt_0 = alphas_bar_sqrt[0].clone()
-    alphas_bar_sqrt_T = alphas_bar_sqrt[-1].clone()
+    # Save the endpoints (no need to clone, just extract as scalar)
+    alphas_bar_sqrt_0 = alphas_bar_sqrt[0]
+    alphas_bar_sqrt_T = alphas_bar_sqrt[-1]
 
-    # Shift so the last timestep is zero.
-    alphas_bar_sqrt -= alphas_bar_sqrt_T
-
-    # Scale so the first timestep is back to the old value.
-    alphas_bar_sqrt *= alphas_bar_sqrt_0 / (alphas_bar_sqrt_0 - alphas_bar_sqrt_T)
+    # Fused inplace shift and scale:
+    scale = alphas_bar_sqrt_0 / (alphas_bar_sqrt_0 - alphas_bar_sqrt_T)
+    # Out-of-place to keep graph and avoid side effects
+    alphas_bar_sqrt = (alphas_bar_sqrt - alphas_bar_sqrt_T) * scale
 
     # Convert alphas_bar_sqrt to betas
-    alphas_bar = alphas_bar_sqrt**2  # Revert sqrt
-    alphas = alphas_bar[1:] / alphas_bar[:-1]  # Revert cumprod
-    alphas = torch.cat([alphas_bar[0:1], alphas])
-    betas = 1 - alphas
+    alphas_bar = alphas_bar_sqrt.square()
+    # Fused division, avoiding temporary variables
+    alphas_new = torch.cat([alphas_bar[0:1], alphas_bar[1:] / alphas_bar[:-1]])
+    betas_rescaled = 1.0 - alphas_new
 
-    return betas
+    return betas_rescaled
 
 
 class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
