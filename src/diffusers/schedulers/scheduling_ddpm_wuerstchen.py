@@ -109,8 +109,9 @@ class DDPMWuerstchenScheduler(SchedulerMixin, ConfigMixin):
         s: float = 0.008,
     ):
         self.scaler = scaler
-        self.s = torch.tensor([s])
-        self._init_alpha_cumprod = torch.cos(self.s / (1 + self.s) * torch.pi * 0.5) ** 2
+        # Optimize: store s as a float to avoid unnecessary tensor creation in __init__
+        self.s = s
+        self._init_alpha_cumprod = (torch.cos(torch.tensor(self.s / (1 + self.s) * torch.pi * 0.5))) ** 2
 
         # standard deviation of the initial noise distribution
         self.init_noise_sigma = 1.0
@@ -137,6 +138,7 @@ class DDPMWuerstchenScheduler(SchedulerMixin, ConfigMixin):
         Returns:
             `torch.Tensor`: scaled input sample
         """
+        # Directly return the input sample as no operation is needed.
         return sample
 
     def set_timesteps(
