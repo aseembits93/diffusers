@@ -47,6 +47,7 @@ from .import_utils import (
     is_transformers_available,
 )
 from .logging import get_logger
+from unittest import skipUnless
 
 
 if is_torch_available():
@@ -439,7 +440,7 @@ def require_onnxruntime(test_case):
     """
     Decorator marking a test that requires onnxruntime. These tests are skipped when onnxruntime isn't installed.
     """
-    return unittest.skipUnless(is_onnx_available(), "test requires onnxruntime")(test_case)
+    return skipUnless(is_onnx_available(), "test requires onnxruntime")(test_case)
 
 
 def require_note_seq(test_case):
