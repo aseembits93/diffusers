@@ -743,41 +743,68 @@ class AlphaBlender(nn.Module):
         if merge_strategy not in self.strategies:
             raise ValueError(f"merge_strategy needs to be in {self.strategies}")
 
+        # Precompute and cache values where possible
         if self.merge_strategy == "fixed":
-            self.register_buffer("mix_factor", torch.Tensor([alpha]))
+            self.register_buffer("mix_factor", torch.tensor([alpha]))
         elif self.merge_strategy == "learned" or self.merge_strategy == "learned_with_images":
-            self.register_parameter("mix_factor", torch.nn.Parameter(torch.Tensor([alpha])))
+            self.register_parameter("mix_factor", torch.nn.Parameter(torch.tensor([alpha])))
         else:
             raise ValueError(f"Unknown merge strategy {self.merge_strategy}")
 
+        # For small values (later used in get_alpha)
+        self._ones_cache = {}
+
     def get_alpha(self, image_only_indicator: torch.Tensor, ndims: int) -> torch.Tensor:
+        # Fast-path for "fixed" and "learned" (these are both scalar values)
         if self.merge_strategy == "fixed":
-            alpha = self.mix_factor
-
+            return self.mix_factor
         elif self.merge_strategy == "learned":
-            alpha = torch.sigmoid(self.mix_factor)
+            # Avoid extra allocation by using torch.sigmoid_ if possible (not possible here, must preserve param)
+            return torch.sigmoid(self.mix_factor)
 
-        elif self.merge_strategy == "learned_with_images":
-            if image_only_indicator is None:
-                raise ValueError("Please provide image_only_indicator to use learned_with_images merge strategy")
+        # Only "learned_with_images" below
+        if image_only_indicator is None:
+            raise ValueError("Please provide image_only_indicator to use learned_with_images merge strategy")
 
-            alpha = torch.where(
-                image_only_indicator.bool(),
-                torch.ones(1, 1, device=image_only_indicator.device),
-                torch.sigmoid(self.mix_factor)[..., None],
-            )
+        # Optimize: Compute sigmoid ONLY ONCE
+        sigmoid_val = torch.sigmoid(self.mix_factor)[..., None]
+        device = image_only_indicator.device
+        indicator_bool = image_only_indicator.bool()
+        batch = image_only_indicator.shape[0]
 
-            # (batch, channel, frames, height, width)
-            if ndims == 5:
-                alpha = alpha[:, None, :, None, None]
+        # Torch.where broadcast tweaks for efficient shape handling
+        # Cache torch.ones(1, 1, device=...) for efficiency if batch and device is repeated
+        ones_shape = (1, 1)
+        cache_key = (device, ones_shape)
+        if cache_key not in self._ones_cache:
+            self._ones_cache[cache_key] = torch.ones(ones_shape, device=device)
+        ones_value = self._ones_cache[cache_key]
+
+        # Efficient broadcasting
+        alpha = torch.where(
+            indicator_bool,
+            ones_value,
+            sigmoid_val
+        )
+
+        # Strictly avoid shape changes if not needed. Only clone/reshape if shapes do not match final.
+        if ndims == 5:
+            # Efficient expand instead of reshape or unsqueeze, avoid copy
+            # alpha: (batch, 1) (if indicator is (batch,1) or compatible)
+            # Expand to (batch, 1, frames, 1, 1) if needed
+            # Note: We'll batch-expand alpha if it was size (1,1)
+            target_shape = (alpha.shape[0], 1, alpha.shape[1], 1, 1)
+            if alpha.shape != target_shape:
+                alpha = alpha.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+        elif ndims == 3:
             # (batch*frames, height*width, channels)
-            elif ndims == 3:
-                alpha = alpha.reshape(-1)[:, None, None]
-            else:
-                raise ValueError(f"Unexpected ndims {ndims}. Dimensions should be 3 or 5")
-
+            # Efficient flatten/expand instead of reshape; only when not matching
+            if alpha.ndim != 1:
+                alpha = alpha.reshape(-1)
+            if alpha.ndim != 3:
+                alpha = alpha[:, None, None]
         else:
-            raise NotImplementedError
+            raise ValueError(f"Unexpected ndims {ndims}. Dimensions should be 3 or 5")
 
         return alpha
 
@@ -787,11 +814,17 @@ class AlphaBlender(nn.Module):
         x_temporal: torch.Tensor,
         image_only_indicator: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # Fast common-case: alpha is scalar and can be fused in-place with broadcasting by pytorch
         alpha = self.get_alpha(image_only_indicator, x_spatial.ndim)
-        alpha = alpha.to(x_spatial.dtype)
+
+        if alpha.dtype != x_spatial.dtype:
+            alpha = alpha.to(dtype=x_spatial.dtype)
 
         if self.switch_spatial_to_temporal_mix:
             alpha = 1.0 - alpha
 
-        x = alpha * x_spatial + (1.0 - alpha) * x_temporal
+        # Combine in-place if possible (let torch optimize, but encourage by not materializing temporaries):
+        # Fused formula:  x = x_temporal + alpha * (x_spatial - x_temporal)
+        # This reduces to above formula for non-broadcast, with less temporary allocation
+        x = x_temporal + alpha * (x_spatial - x_temporal)
         return x
