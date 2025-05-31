@@ -1231,13 +1231,10 @@ def backend_max_memory_allocated(device: str):
 # These are callables which return boolean behaviour flags and can be used to specify some
 # device agnostic alternative where the feature is unsupported.
 def backend_supports_training(device: str):
-    if not is_torch_available():
+    if not _TORCH_AVAILABLE:
         return False
-
-    if device not in BACKEND_SUPPORTS_TRAINING:
-        device = "default"
-
-    return BACKEND_SUPPORTS_TRAINING[device]
+    # Faster dictionary get with default fallback
+    return BACKEND_SUPPORTS_TRAINING.get(device, BACKEND_SUPPORTS_TRAINING["default"])
 
 
 # Guard for when Torch is not available
@@ -1377,3 +1374,5 @@ class Expectations(DevicePropertiesUserDict):
 
     def __repr__(self):
         return f"{self.data}"
+
+_TORCH_AVAILABLE = is_torch_available()
