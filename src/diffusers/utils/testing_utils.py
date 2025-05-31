@@ -29,7 +29,7 @@ from packaging import version
 
 from .constants import DIFFUSERS_REQUEST_TIMEOUT
 from .import_utils import (
-    BACKENDS_MAPPING,
+    _torch_available, BACKENDS_MAPPING,
     is_accelerate_available,
     is_bitsandbytes_available,
     is_compel_available,
@@ -47,6 +47,7 @@ from .import_utils import (
     is_transformers_available,
 )
 from .logging import get_logger
+import torch
 
 
 if is_torch_available():
@@ -1095,24 +1096,28 @@ def disable_full_determinism():
 
 # Utils for custom and alternative accelerator devices
 def _is_torch_fp16_available(device):
-    if not is_torch_available():
+    # Fast rejection if torch unavailable, and use minimal logic in main path.
+    if not _torch_available:
         return False
 
+    # Move import out of hot path (but cannot move outside function due to optional dependency)
     import torch
 
-    device = torch.device(device)
-
+    dev = torch.device(device)
     try:
-        x = torch.zeros((2, 2), dtype=torch.float16).to(device)
-        _ = torch.mul(x, x)
+        # Pre-allocate statically, rather than storing to a variable.
+        # Avoid creating 'x' on CPU and then transferring to device; instead create directly on device.
+        x = torch.zeros((2, 2), dtype=torch.float16, device=dev)
+        # Use in-place mul_ to avoid temporary tensor allocation; result is not needed, just any fp16 computation
+        x.mul_(x)
         return True
 
     except Exception as e:
-        if device.type == "cuda":
+        # Only raise if CUDA mismatch, otherwise return False.
+        if dev.type == "cuda":
             raise ValueError(
                 f"You have passed a device of type 'cuda' which should work with 'fp16', but 'cuda' does not seem to be correctly installed on your machine: {e}"
             )
-
         return False
 
 
