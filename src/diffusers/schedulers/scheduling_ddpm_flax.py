@@ -160,37 +160,40 @@ class FlaxDDPMScheduler(FlaxSchedulerMixin, ConfigMixin):
         )
 
     def _get_variance(self, state: DDPMSchedulerState, t, predicted_variance=None, variance_type=None):
-        alpha_prod_t = state.common.alphas_cumprod[t]
-        alpha_prod_t_prev = jnp.where(t > 0, state.common.alphas_cumprod[t - 1], jnp.array(1.0, dtype=self.dtype))
-
-        # For t > 0, compute predicted variance βt (see formula (6) and (7) from https://arxiv.org/pdf/2006.11239.pdf)
-        # and sample from it to get previous sample
-        # x_{t-1} ~ N(pred_prev_sample, variance) == add variance to pred_sample
-        variance = (1 - alpha_prod_t_prev) / (1 - alpha_prod_t) * state.common.betas[t]
+        alpha_prod_t, alpha_prod_t_prev, beta_t = self._fast_alpha_prod(state, t, self.dtype)
 
         if variance_type is None:
             variance_type = self.config.variance_type
 
-        # hacks - were probably added for training stability
+        # Compute variance, avoid repeated indexing and computation where possible
+        # Formula: variance = (1 - alpha_prod_t_prev) / (1 - alpha_prod_t) * beta_t
+        one = 1.0
+
+        # Use jnp.where to only compute complex expressions on demand
         if variance_type == "fixed_small":
-            variance = jnp.clip(variance, a_min=1e-20)
-        # for rl-diffuser https://arxiv.org/abs/2205.09991
+            var = (one - alpha_prod_t_prev) / (one - alpha_prod_t) * beta_t
+            var = jnp.clip(var, a_min=1e-20)
         elif variance_type == "fixed_small_log":
-            variance = jnp.log(jnp.clip(variance, a_min=1e-20))
+            var = (one - alpha_prod_t_prev) / (one - alpha_prod_t) * beta_t
+            var = jnp.log(jnp.clip(var, a_min=1e-20))
         elif variance_type == "fixed_large":
-            variance = state.common.betas[t]
+            var = beta_t
         elif variance_type == "fixed_large_log":
-            # Glide max_log
-            variance = jnp.log(state.common.betas[t])
+            var = jnp.log(beta_t)
         elif variance_type == "learned":
             return predicted_variance
         elif variance_type == "learned_range":
-            min_log = variance
-            max_log = state.common.betas[t]
+            # Efficient learned_range: only get min_log (from variance) and max_log (from betas).
+            min_log = (one - alpha_prod_t_prev) / (one - alpha_prod_t) * beta_t
+            max_log = beta_t
             frac = (predicted_variance + 1) / 2
-            variance = frac * max_log + (1 - frac) * min_log
+            var = frac * max_log + (1 - frac) * min_log
+        else:
+            # default to fixed_small logic as baseline fallback
+            var = (one - alpha_prod_t_prev) / (one - alpha_prod_t) * beta_t
+            var = jnp.clip(var, a_min=1e-20)
 
-        return variance
+        return var
 
     def step(
         self,
@@ -301,3 +304,31 @@ class FlaxDDPMScheduler(FlaxSchedulerMixin, ConfigMixin):
 
     def __len__(self):
         return self.config.num_train_timesteps
+
+    @staticmethod
+    def _fast_alpha_prod(state, t, dtype):
+        """
+        Fast access for alpha_prod_t and alpha_prod_t_prev.
+        If t is a scalar integer, we just return using slicing (faster than jnp.where).
+        If t is an array, we vectorize.
+        """
+        # This function is only called in _get_variance, which has t as an integer or array of int
+        alphas_cumprod = state.common.alphas_cumprod
+        betas = state.common.betas
+
+        if isinstance(t, int):
+            # t is scalar integer
+            alpha_prod_t = alphas_cumprod[t]
+            alpha_prod_t_prev = alphas_cumprod[t - 1] if t > 0 else jnp.array(1.0, dtype=dtype)
+            beta = betas[t]
+        else:
+            # t is jnp.ndarray integer
+            t_minus1 = t - 1
+            alpha_prod_t = alphas_cumprod[t]
+            alpha_prod_t_prev = jnp.where(
+                t > 0,
+                alphas_cumprod[t_minus1],
+                jnp.array(1.0, dtype=dtype),
+            )
+            beta = betas[t]
+        return alpha_prod_t, alpha_prod_t_prev, beta
