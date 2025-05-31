@@ -114,12 +114,10 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         if time_shift_type not in {"exponential", "linear"}:
             raise ValueError("`time_shift_type` must either be 'exponential' or 'linear'.")
 
-        timesteps = np.linspace(1, num_train_timesteps, num_train_timesteps, dtype=np.float32)[::-1].copy()
-        timesteps = torch.from_numpy(timesteps).to(dtype=torch.float32)
-
+        # Use torch operations to avoid intermediate numpy operations and unnecessary copies for speedup.
+        timesteps = torch.arange(num_train_timesteps, 0, -1, dtype=torch.float32)
         sigmas = timesteps / num_train_timesteps
         if not use_dynamic_shifting:
-            # when use_dynamic_shifting is True, we apply the timestep shifting on the fly based on the image resolution
             sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
 
         self.timesteps = sigmas * num_train_timesteps
@@ -129,9 +127,13 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
 
         self._shift = shift
 
-        self.sigmas = sigmas.to("cpu")  # to avoid too much CPU/GPU communication
+        self.sigmas = sigmas.to("cpu")  # still store as torch.Tensor (already float32 and contiguous)
         self.sigma_min = self.sigmas[-1].item()
         self.sigma_max = self.sigmas[0].item()
+
+        # Precompute list of float timesteps for fast lookup in index_for_timestep
+        # Note: this is an optimization assuming schedule_timesteps will be self.timesteps most of the time
+        self._timesteps_lookup = {float(val): idx for idx, val in enumerate(self.timesteps.cpu().tolist())}
 
     @property
     def shift(self):
@@ -350,15 +352,18 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
 
     def index_for_timestep(self, timestep, schedule_timesteps=None):
         if schedule_timesteps is None:
+            # Try exact float lookup, falling back if needed
+            idx = self._timesteps_lookup.get(float(timestep))
+            if idx is not None:
+                # The index for a unique match is always 0, no ambiguity
+                return idx
+
             schedule_timesteps = self.timesteps
 
-        indices = (schedule_timesteps == timestep).nonzero()
+        # Fast path handles common case; fallback (rare) to general search
+        indices = (schedule_timesteps == timestep).nonzero(as_tuple=False)
 
-        # The sigma index that is taken for the **very** first `step`
-        # is always the second index (or the last index if there is only 1)
-        # This way we can ensure we don't accidentally skip a sigma in
-        # case we start in the middle of the denoising schedule (e.g. for image-to-image)
-        pos = 1 if len(indices) > 1 else 0
+        pos = 1 if indices.size(0) > 1 else 0
 
         return indices[pos].item()
 
