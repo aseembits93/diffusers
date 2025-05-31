@@ -592,7 +592,7 @@ def deprecate_after_peft_backend(test_case):
     """
     Decorator marking a test that will be skipped after PEFT backend
     """
-    return unittest.skipUnless(not USE_PEFT_BACKEND, "test skipped in favor of PEFT backend")(test_case)
+    return _skip_unless_no_peft_backend(test_case)
 
 
 def get_python_version():
@@ -1377,3 +1377,7 @@ class Expectations(DevicePropertiesUserDict):
 
     def __repr__(self):
         return f"{self.data}"
+
+_skip_unless_no_peft_backend = unittest.skipUnless(
+    not USE_PEFT_BACKEND, "test skipped in favor of PEFT backend"
+)
