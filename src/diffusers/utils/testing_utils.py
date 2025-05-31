@@ -187,12 +187,11 @@ def str_to_bool(value) -> int:
     `on`, and `1`; False value are `n`, `no`, `f`, `false`, `off`, and `0`;
     """
     value = value.lower()
-    if value in ("y", "yes", "t", "true", "on", "1"):
+    if value in _TRUE_SET:
         return 1
-    elif value in ("n", "no", "f", "false", "off", "0"):
+    if value in _FALSE_SET:
         return 0
-    else:
-        raise ValueError(f"invalid truth value {value}")
+    raise ValueError(f"invalid truth value {value}")
 
 
 def parse_flag_from_env(key, default=False):
@@ -1377,3 +1376,7 @@ class Expectations(DevicePropertiesUserDict):
 
     def __repr__(self):
         return f"{self.data}"
+
+_TRUE_SET = {"y", "yes", "t", "true", "on", "1"}
+
+_FALSE_SET = {"n", "no", "f", "false", "off", "0"}
