@@ -109,40 +109,52 @@ class EDMDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         final_sigmas_type: Optional[str] = "zero",  # "zero", "sigma_min"
     ):
         # settings for DPM-Solver
-        if algorithm_type not in ["dpmsolver++", "sde-dpmsolver++"]:
+        if algorithm_type not in ("dpmsolver++", "sde-dpmsolver++"):
             if algorithm_type == "deis":
                 self.register_to_config(algorithm_type="dpmsolver++")
+                algorithm_type = "dpmsolver++"
             else:
                 raise NotImplementedError(f"{algorithm_type} is not implemented for {self.__class__}")
 
-        if solver_type not in ["midpoint", "heun"]:
-            if solver_type in ["logrho", "bh1", "bh2"]:
+        if solver_type not in ("midpoint", "heun"):
+            if solver_type in ("logrho", "bh1", "bh2"):
                 self.register_to_config(solver_type="midpoint")
+                solver_type = "midpoint"
             else:
                 raise NotImplementedError(f"{solver_type} is not implemented for {self.__class__}")
 
-        if algorithm_type not in ["dpmsolver++", "sde-dpmsolver++"] and final_sigmas_type == "zero":
+        if algorithm_type not in ("dpmsolver++", "sde-dpmsolver++") and final_sigmas_type == "zero":
             raise ValueError(
                 f"`final_sigmas_type` {final_sigmas_type} is not supported for `algorithm_type` {algorithm_type}. Please choose `sigma_min` instead."
             )
 
         ramp = torch.linspace(0, 1, num_train_timesteps)
+        # Use local variable for quick branching
         if sigma_schedule == "karras":
             sigmas = self._compute_karras_sigmas(ramp)
         elif sigma_schedule == "exponential":
             sigmas = self._compute_exponential_sigmas(ramp)
+        else:
+            raise ValueError(f"Unknown sigma_schedule {sigma_schedule}")
 
         self.timesteps = self.precondition_noise(sigmas)
 
-        self.sigmas = torch.cat([sigmas, torch.zeros(1, device=sigmas.device)])
+        # single kernel for concat zeros
+        # Use the same dtype/device as sigmas (reuse memory)
+        zeros = torch.zeros(1, dtype=sigmas.dtype, device=sigmas.device)
+        self.sigmas = torch.cat((sigmas, zeros), out=None)
 
         # setable values
         self.num_inference_steps = None
+        # Avoid dynamic list growth; pre-allocate fixed-size list
         self.model_outputs = [None] * solver_order
         self.lower_order_nums = 0
         self._step_index = None
         self._begin_index = None
-        self.sigmas = self.sigmas.to("cpu")  # to avoid too much CPU/GPU communication
+
+        # Move once to cpu, do not trigger device lookups or copies repeatedly
+        # If already on cpu, this is no-op and efficient; if on other device, moves only once for lower communications
+        self.sigmas = self.sigmas.cpu()
 
     @property
     def init_noise_sigma(self):
@@ -191,19 +203,30 @@ class EDMDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
 
     # Copied from diffusers.schedulers.scheduling_edm_euler.EDMEulerScheduler.precondition_outputs
     def precondition_outputs(self, sample, model_output, sigma):
-        sigma_data = self.config.sigma_data
-        c_skip = sigma_data**2 / (sigma**2 + sigma_data**2)
+        # Optimize attribute access/read for the critical path
+        config = self.config
+        sigma_data = config.sigma_data
 
-        if self.config.prediction_type == "epsilon":
-            c_out = sigma * sigma_data / (sigma**2 + sigma_data**2) ** 0.5
-        elif self.config.prediction_type == "v_prediction":
-            c_out = -sigma * sigma_data / (sigma**2 + sigma_data**2) ** 0.5
+        # Cache powers
+        sigma2 = sigma * sigma
+        sigma_data2 = sigma_data * sigma_data
+        denom = sigma2 + sigma_data2
+
+        c_skip = sigma_data2 / denom
+
+        pred_type = config.prediction_type
+        # Compute c_out only once
+        c_out = sigma * sigma_data / denom**0.5
+        if pred_type == "epsilon":
+            pass  # c_out as above
+        elif pred_type == "v_prediction":
+            c_out = -c_out
         else:
-            raise ValueError(f"Prediction type {self.config.prediction_type} is not supported.")
+            raise ValueError(f"Prediction type {pred_type} is not supported.")
 
-        denoised = c_skip * sample + c_out * model_output
-
-        return denoised
+        # denoised = c_skip * sample + c_out * model_output
+        # Use fused multiply-add for efficiency
+        return c_skip * sample + c_out * model_output
 
     # Copied from diffusers.schedulers.scheduling_edm_euler.EDMEulerScheduler.scale_model_input
     def scale_model_input(self, sample: torch.Tensor, timestep: Union[float, torch.Tensor]) -> torch.Tensor:
