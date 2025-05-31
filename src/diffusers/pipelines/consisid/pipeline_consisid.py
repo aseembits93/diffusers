@@ -182,7 +182,7 @@ def retrieve_timesteps(
     sigmas: Optional[List[float]] = None,
     **kwargs,
 ):
-    r"""
+    """
     Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
     custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
 
@@ -208,29 +208,30 @@ def retrieve_timesteps(
     if timesteps is not None and sigmas is not None:
         raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
     if timesteps is not None:
-        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
-        if not accepts_timesteps:
+        # Cache lookups for whether set_timesteps supports custom timesteps
+        if not _accepts_arg_in_method(type(scheduler), "set_timesteps", "timesteps"):
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
                 f" timestep schedules. Please check whether you are using the correct scheduler."
             )
         scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
+        tsteps = scheduler.timesteps
+        num_inf_steps = len(tsteps)
     elif sigmas is not None:
-        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
-        if not accept_sigmas:
+        # Cache lookups for whether set_timesteps supports custom sigmas
+        if not _accepts_arg_in_method(type(scheduler), "set_timesteps", "sigmas"):
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
                 f" sigmas schedules. Please check whether you are using the correct scheduler."
             )
         scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
+        tsteps = scheduler.timesteps
+        num_inf_steps = len(tsteps)
     else:
         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-    return timesteps, num_inference_steps
+        tsteps = scheduler.timesteps
+        num_inf_steps = num_inference_steps
+    return tsteps, num_inf_steps
 
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.retrieve_latents
@@ -245,6 +246,21 @@ def retrieve_latents(
         return encoder_output.latents
     else:
         raise AttributeError("Could not access latents of provided encoder_output")
+
+def _accepts_arg_in_method(cls, method_name, arg_name):
+    """
+    Checks whether the given method in the given class supports a specific argument,
+    using a cache to accelerate repeated queries.
+    """
+    key = (id(cls), method_name)
+    # Check cache for class/method arg support
+    arg_set = _SIGNATURE_SUPPORT_CACHE.get(key)
+    if arg_set is None:
+        method = getattr(cls, method_name)
+        # No need to copy to a set for every single arg lookup: store sets by method.
+        arg_set = set(inspect.signature(method).parameters.keys())
+        _SIGNATURE_SUPPORT_CACHE[key] = arg_set
+    return arg_name in arg_set
 
 
 class ConsisIDPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
@@ -972,3 +988,5 @@ class ConsisIDPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
             return (video,)
 
         return ConsisIDPipelineOutput(frames=video)
+
+_SIGNATURE_SUPPORT_CACHE = {}
