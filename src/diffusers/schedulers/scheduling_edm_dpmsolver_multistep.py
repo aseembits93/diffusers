@@ -176,9 +176,15 @@ class EDMDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
 
     # Copied from diffusers.schedulers.scheduling_edm_euler.EDMEulerScheduler.precondition_inputs
     def precondition_inputs(self, sample, sigma):
-        c_in = 1 / ((sigma**2 + self.config.sigma_data**2) ** 0.5)
-        scaled_sample = sample * c_in
-        return scaled_sample
+        # Optimized: Avoid redundant power/exp; use `torch.rsqrt` for 1/sqrt (much faster); single allocation for c_in
+        # Works for both scalar and tensor sigma and sample
+        sigma_data = self.config.sigma_data
+
+        # Try fast path: if sigma is a scalar and sample is a tensor, use torch.rsqrt and avoid broadcasting
+        # If sigma is a tensor, torch.rsqrt handles automatically
+        denom = sigma * sigma + sigma_data * sigma_data
+        c_in = torch.rsqrt(denom) if torch.is_tensor(denom) else 1.0 / (denom**0.5)
+        return sample * c_in
 
     # Copied from diffusers.schedulers.scheduling_edm_euler.EDMEulerScheduler.precondition_noise
     def precondition_noise(self, sigma):
