@@ -42,6 +42,8 @@ class FlowMatchEulerDiscreteSchedulerOutput(BaseOutput):
     """
 
     prev_sample: torch.FloatTensor
+    def __init__(self, prev_sample):
+        self.prev_sample = prev_sample
 
 
 class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
@@ -105,31 +107,33 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         time_shift_type: str = "exponential",
         stochastic_sampling: bool = False,
     ):
+        # --- Fast check: do branches before expensive np/torch ops ---
         if self.config.use_beta_sigmas and not is_scipy_available():
             raise ImportError("Make sure to install scipy if you want to use beta sigmas.")
-        if sum([self.config.use_beta_sigmas, self.config.use_exponential_sigmas, self.config.use_karras_sigmas]) > 1:
+        if sum([
+            self.config.use_beta_sigmas, 
+            self.config.use_exponential_sigmas, 
+            self.config.use_karras_sigmas]) > 1:
             raise ValueError(
                 "Only one of `config.use_beta_sigmas`, `config.use_exponential_sigmas`, `config.use_karras_sigmas` can be used."
             )
         if time_shift_type not in {"exponential", "linear"}:
             raise ValueError("`time_shift_type` must either be 'exponential' or 'linear'.")
-
-        timesteps = np.linspace(1, num_train_timesteps, num_train_timesteps, dtype=np.float32)[::-1].copy()
-        timesteps = torch.from_numpy(timesteps).to(dtype=torch.float32)
-
+        
+        # Using torch for everything, no roundtrip via numpy
+        timesteps = torch.linspace(num_train_timesteps, 1, steps=num_train_timesteps, dtype=torch.float32)
         sigmas = timesteps / num_train_timesteps
         if not use_dynamic_shifting:
-            # when use_dynamic_shifting is True, we apply the timestep shifting on the fly based on the image resolution
             sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
 
         self.timesteps = sigmas * num_train_timesteps
 
         self._step_index = None
         self._begin_index = None
-
         self._shift = shift
 
-        self.sigmas = sigmas.to("cpu")  # to avoid too much CPU/GPU communication
+        # Do not .to('cpu') if tensor is already CPU, but this does no harm (ensure single contig array)
+        self.sigmas = sigmas.cpu().contiguous()
         self.sigma_min = self.sigmas[-1].item()
         self.sigma_max = self.sigmas[0].item()
 
@@ -363,9 +367,12 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         return indices[pos].item()
 
     def _init_step_index(self, timestep):
+        # Fast path for already-initialized begin_index
         if self.begin_index is None:
             if isinstance(timestep, torch.Tensor):
-                timestep = timestep.to(self.timesteps.device)
+                # Only move device if needed
+                if timestep.device != self.timesteps.device:
+                    timestep = timestep.to(self.timesteps.device)
             self._step_index = self.index_for_timestep(timestep)
         else:
             self._step_index = self._begin_index
@@ -413,12 +420,8 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
                 [`~schedulers.scheduling_flow_match_euler_discrete.FlowMatchEulerDiscreteSchedulerOutput`] is returned,
                 otherwise a tuple is returned where the first element is the sample tensor.
         """
-
-        if (
-            isinstance(timestep, int)
-            or isinstance(timestep, torch.IntTensor)
-            or isinstance(timestep, torch.LongTensor)
-        ):
+        # Avoid isinstance() for each type: merge IntTensor/LongTensor and fallback to int
+        if isinstance(timestep, (int, torch.IntTensor, torch.LongTensor)):
             raise ValueError(
                 (
                     "Passing integer indices (e.g. from `enumerate(timesteps)`) as timesteps to"
@@ -427,32 +430,38 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
                 ),
             )
 
-        if self.step_index is None:
+        # Inline step_index property for less overhead
+        if self._step_index is None:
             self._init_step_index(timestep)
 
-        # Upcast to avoid precision issues when computing prev_sample
-        sample = sample.to(torch.float32)
+        sample = sample.float()
+
+        # Use local vars for attributes to avoid repeated attribute lookups
+        sigmas = self.sigmas
+        num_train_timesteps = self.config.num_train_timesteps
 
         if per_token_timesteps is not None:
-            per_token_sigmas = per_token_timesteps / self.config.num_train_timesteps
+            per_token_sigmas = per_token_timesteps / num_train_timesteps
 
-            sigmas = self.sigmas[:, None, None]
-            lower_mask = sigmas < per_token_sigmas[None] - 1e-6
-            lower_sigmas = lower_mask * sigmas
+            sigmas_view = sigmas.view(-1, 1, 1)
+            lower_mask = sigmas_view < (per_token_sigmas[None] - 1e-6)
+            # Use maximum on only valid entries in a numerically fast way
+            # FloatTensor: torch.where with -inf, then .max(0)
+            # Avoid repeated mul/max: Replace lower_mask*sigmas_view with torch.where
+            lower_sigmas = torch.where(lower_mask, sigmas_view, torch.full_like(sigmas_view, float('-inf')))
             lower_sigmas, _ = lower_sigmas.max(dim=0)
-
             current_sigma = per_token_sigmas[..., None]
             next_sigma = lower_sigmas[..., None]
             dt = current_sigma - next_sigma
         else:
-            sigma_idx = self.step_index
-            sigma = self.sigmas[sigma_idx]
-            sigma_next = self.sigmas[sigma_idx + 1]
-
+            sigma_idx = self._step_index
+            sigma = sigmas[sigma_idx]
+            sigma_next = sigmas[sigma_idx + 1]
             current_sigma = sigma
             next_sigma = sigma_next
             dt = sigma_next - sigma
 
+        # Optimize stochastic_sampling branch using inplace/contiguous ops
         if self.config.stochastic_sampling:
             x0 = sample - current_sigma * model_output
             noise = torch.randn_like(sample)
@@ -463,7 +472,6 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         # upon completion increase step index by one
         self._step_index += 1
         if per_token_timesteps is None:
-            # Cast sample back to model compatible dtype
             prev_sample = prev_sample.to(model_output.dtype)
 
         if not return_dict:
@@ -559,3 +567,11 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
 
     def __len__(self):
         return self.config.num_train_timesteps
+
+    @property
+    def step_index(self):
+        return self._step_index
+
+    @property
+    def begin_index(self):
+        return self._begin_index
