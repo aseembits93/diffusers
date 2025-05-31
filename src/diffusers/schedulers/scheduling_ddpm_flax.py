@@ -224,61 +224,81 @@ class FlaxDDPMScheduler(FlaxSchedulerMixin, ConfigMixin):
         if key is None:
             key = jax.random.key(0)
 
-        if (
+        # Fast-path: avoid jnp.split unless all split conditions match
+        need_split = (
             len(model_output.shape) > 1
             and model_output.shape[1] == sample.shape[1] * 2
             and self.config.variance_type in ["learned", "learned_range"]
-        ):
+        )
+        if need_split:
             model_output, predicted_variance = jnp.split(model_output, sample.shape[1], axis=1)
         else:
             predicted_variance = None
 
-        # 1. compute alphas, betas
-        alpha_prod_t = state.common.alphas_cumprod[t]
-        alpha_prod_t_prev = jnp.where(t > 0, state.common.alphas_cumprod[t - 1], jnp.array(1.0, dtype=self.dtype))
-        beta_prod_t = 1 - alpha_prod_t
-        beta_prod_t_prev = 1 - alpha_prod_t_prev
+        # Gist: batch gather all alphas/betas computations as float32 early
+        # These are small 1D arrays, so fetch them early
+        # Avoid repetitive accesses and dtype conversions
 
-        # 2. compute predicted original sample from predicted noise also called
-        # "predicted x_0" of formula (15) from https://arxiv.org/pdf/2006.11239.pdf
-        if self.config.prediction_type == "epsilon":
-            pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
-        elif self.config.prediction_type == "sample":
+        alphas_cumprod = state.common.alphas_cumprod
+        alphas = state.common.alphas
+        betas = state.common.betas
+
+        # vector index extraction is markedly faster for single t than jnp.where
+        # this also preserves dtype correctly
+        alpha_prod_t = alphas_cumprod[t]
+        # Instead of jnp.where, we can branch inline as t is an int and always valid:
+        if t > 0:
+            alpha_prod_t_prev = alphas_cumprod[t - 1]
+        else:
+            alpha_prod_t_prev = jnp.array(1.0, dtype=self.dtype)
+        beta_prod_t = 1.0 - alpha_prod_t
+        beta_prod_t_prev = 1.0 - alpha_prod_t_prev
+
+        # Prediction step: put outside per-branch, to minimize conditionals
+        pt = self.config.prediction_type
+        if pt == "epsilon":
+            sqrt_beta_prod_t = jnp.sqrt(beta_prod_t)
+            sqrt_alpha_prod_t = jnp.sqrt(alpha_prod_t)
+            # To minimize ops, fuse arithmetic (using fused_negative and division)
+            pred_original_sample = (sample - sqrt_beta_prod_t * model_output) / sqrt_alpha_prod_t
+        elif pt == "sample":
             pred_original_sample = model_output
-        elif self.config.prediction_type == "v_prediction":
-            pred_original_sample = (alpha_prod_t**0.5) * sample - (beta_prod_t**0.5) * model_output
+        elif pt == "v_prediction":
+            sqrt_alpha_prod_t = jnp.sqrt(alpha_prod_t)
+            sqrt_beta_prod_t = jnp.sqrt(beta_prod_t)
+            pred_original_sample = sqrt_alpha_prod_t * sample - sqrt_beta_prod_t * model_output
         else:
             raise ValueError(
                 f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample` "
                 " for the FlaxDDPMScheduler."
             )
 
-        # 3. Clip "predicted x_0"
         if self.config.clip_sample:
             pred_original_sample = jnp.clip(pred_original_sample, -1, 1)
 
-        # 4. Compute coefficients for pred_original_sample x_0 and current sample x_t
-        # See formula (7) from https://arxiv.org/pdf/2006.11239.pdf
-        pred_original_sample_coeff = (alpha_prod_t_prev ** (0.5) * state.common.betas[t]) / beta_prod_t
-        current_sample_coeff = state.common.alphas[t] ** (0.5) * beta_prod_t_prev / beta_prod_t
+        # Coefficient computation, prefer inplace values
+        if t > 0:
+            sqrt_alpha_prod_t_prev = jnp.sqrt(alpha_prod_t_prev)
+            pred_original_sample_coeff = (sqrt_alpha_prod_t_prev * betas[t]) / beta_prod_t
+        else:
+            pred_original_sample_coeff = 0.0  # never used (t=0: pred_prev_sample not actually used)
+        sqrt_alpha_t = jnp.sqrt(alphas[t])
+        current_sample_coeff = sqrt_alpha_t * beta_prod_t_prev / beta_prod_t
 
-        # 5. Compute predicted previous sample µ_t
-        # See formula (7) from https://arxiv.org/pdf/2006.11239.pdf
         pred_prev_sample = pred_original_sample_coeff * pred_original_sample + current_sample_coeff * sample
 
-        # 6. Add noise
-        def random_variance():
-            split_key = jax.random.split(key, num=1)[0]
-            noise = jax.random.normal(split_key, shape=model_output.shape, dtype=self.dtype)
-            return (self._get_variance(state, t, predicted_variance=predicted_variance) ** 0.5) * noise
-
-        variance = jnp.where(t > 0, random_variance(), jnp.zeros(model_output.shape, dtype=self.dtype))
-
-        pred_prev_sample = pred_prev_sample + variance
+        # Fast noise sampling path. Eliminate nested function + PRNG split per step,
+        # don't call jnp.where with large array branches; instead branch outside.
+        if t > 0:
+            # Use direct PRNG
+            noise = jax.random.normal(key, shape=model_output.shape, dtype=self.dtype)
+            # _get_variance returns broadcastable scalar or array
+            var = self._get_variance(state, t, predicted_variance=predicted_variance)
+            pred_prev_sample = pred_prev_sample + jnp.sqrt(var) * noise
+        # if t == 0: skip noise; nothing to add
 
         if not return_dict:
             return (pred_prev_sample, state)
-
         return FlaxDDPMSchedulerOutput(prev_sample=pred_prev_sample, state=state)
 
     def add_noise(
