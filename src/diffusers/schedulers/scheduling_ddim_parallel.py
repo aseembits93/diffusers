@@ -624,21 +624,34 @@ class DDIMParallelScheduler(SchedulerMixin, ConfigMixin):
 
     # Copied from diffusers.schedulers.scheduling_ddpm.DDPMScheduler.get_velocity
     def get_velocity(self, sample: torch.Tensor, noise: torch.Tensor, timesteps: torch.IntTensor) -> torch.Tensor:
-        # Make sure alphas_cumprod and timestep have same device and dtype as sample
-        self.alphas_cumprod = self.alphas_cumprod.to(device=sample.device)
-        alphas_cumprod = self.alphas_cumprod.to(dtype=sample.dtype)
-        timesteps = timesteps.to(sample.device)
+        # Get the device and dtype from sample only once
+        device = sample.device
+        dtype = sample.dtype
 
-        sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
-        sqrt_alpha_prod = sqrt_alpha_prod.flatten()
-        while len(sqrt_alpha_prod.shape) < len(sample.shape):
-            sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
+        # Move alphas_cumprod to required device/dtype only if needed
+        if self.alphas_cumprod.device != device or self.alphas_cumprod.dtype != dtype:
+            alphas_cumprod = self.alphas_cumprod.to(device=device, dtype=dtype)
+        else:
+            alphas_cumprod = self.alphas_cumprod
 
-        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
-        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
-        while len(sqrt_one_minus_alpha_prod.shape) < len(sample.shape):
-            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+        # Ensure timesteps are of shape (N,) and on correct device
+        if timesteps.device != device:
+            timesteps = timesteps.to(device)
+        # Remove extra dims if any
+        timesteps = timesteps.flatten()
 
+        # Gather required alphas
+        alpha_prod = torch.index_select(alphas_cumprod, 0, timesteps)  # (N,)
+        sqrt_alpha_prod = torch.sqrt(alpha_prod)  # (N,)
+        sqrt_one_minus_alpha_prod = torch.sqrt(1 - alpha_prod)  # (N,)
+
+        # Efficient broadcasting to match sample/noise shape
+        # The batch size is on leading dimension (assumed), supports batch or sample-wise calls
+        # Use view(-1, *[1]*(sample.dim()-1)) to expand correctly for N-dim tensors
+        shape_broadcast = (sqrt_alpha_prod.shape[0],) + (1,) * (sample.dim() - 1)
+        sqrt_alpha_prod = sqrt_alpha_prod.view(shape_broadcast)
+        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.view(shape_broadcast)
+        # Broadcast if needed, torch will handle
         velocity = sqrt_alpha_prod * noise - sqrt_one_minus_alpha_prod * sample
         return velocity
 
