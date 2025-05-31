@@ -47,6 +47,7 @@ from .import_utils import (
     is_transformers_available,
 )
 from .logging import get_logger
+import torch
 
 
 if is_torch_available():
@@ -328,9 +329,12 @@ def require_torch_multi_gpu(test_case):
     if not is_torch_available():
         return unittest.skip("test requires PyTorch")(test_case)
 
+    # Import torch only if torch is actually available
     import torch
 
-    return unittest.skipUnless(torch.cuda.device_count() > 1, "test requires multiple GPUs")(test_case)
+    if torch.cuda.device_count() > 1:
+        return test_case
+    return unittest.skip("test requires multiple GPUs")(test_case)
 
 
 def require_torch_multi_accelerator(test_case):
