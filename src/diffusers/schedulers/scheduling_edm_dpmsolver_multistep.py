@@ -126,23 +126,29 @@ class EDMDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
                 f"`final_sigmas_type` {final_sigmas_type} is not supported for `algorithm_type` {algorithm_type}. Please choose `sigma_min` instead."
             )
 
-        ramp = torch.linspace(0, 1, num_train_timesteps)
+        # Only move to cpu once at construction, not inside any hot path
+        device = "cpu"
+
+        ramp = torch.linspace(0, 1, num_train_timesteps, device=device)
         if sigma_schedule == "karras":
             sigmas = self._compute_karras_sigmas(ramp)
         elif sigma_schedule == "exponential":
             sigmas = self._compute_exponential_sigmas(ramp)
 
         self.timesteps = self.precondition_noise(sigmas)
-
         self.sigmas = torch.cat([sigmas, torch.zeros(1, device=sigmas.device)])
 
         # setable values
         self.num_inference_steps = None
+        # model_outputs pre-allocated as list to avoid repeated allocations
         self.model_outputs = [None] * solver_order
         self.lower_order_nums = 0
         self._step_index = None
         self._begin_index = None
-        self.sigmas = self.sigmas.to("cpu")  # to avoid too much CPU/GPU communication
+        self.sigmas = self.sigmas.to(device)  # avoid repeated device transfers
+
+        # cache scalar tensor used for _sigma_to_alpha_sigma_t (avoid creating new tensor each call)
+        self._unit_scalar = torch.tensor(1, dtype=self.sigmas.dtype, device=device)
 
     @property
     def init_noise_sigma(self):
@@ -355,9 +361,9 @@ class EDMDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         return t
 
     def _sigma_to_alpha_sigma_t(self, sigma):
-        alpha_t = torch.tensor(1)  # Inputs are pre-scaled before going into unet, so alpha_t = 1
+        # Use preallocated tensor. No device transfer required.
+        alpha_t = self._unit_scalar
         sigma_t = sigma
-
         return alpha_t, sigma_t
 
     def convert_model_output(
@@ -414,23 +420,36 @@ class EDMDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
             `torch.Tensor`:
                 The sample tensor at the previous timestep.
         """
-        sigma_t, sigma_s = self.sigmas[self.step_index + 1], self.sigmas[self.step_index]
+        # Use local for speed, few attributes are actually used.
+        sigmas = self.sigmas
+        idx = self.step_index
+
+        sigma_t = sigmas[idx + 1]
+        sigma_s = sigmas[idx]
         alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
         alpha_s, sigma_s = self._sigma_to_alpha_sigma_t(sigma_s)
-        lambda_t = torch.log(alpha_t) - torch.log(sigma_t)
-        lambda_s = torch.log(alpha_s) - torch.log(sigma_s)
 
+        # Cache log/exp
+        log_alpha_t = torch.log(alpha_t)
+        log_sigma_t = torch.log(sigma_t)
+        log_alpha_s = torch.log(alpha_s)
+        log_sigma_s = torch.log(sigma_s)
+        lambda_t = log_alpha_t - log_sigma_t
+        lambda_s = log_alpha_s - log_sigma_s
         h = lambda_t - lambda_s
+
         if self.config.algorithm_type == "dpmsolver++":
-            x_t = (sigma_t / sigma_s) * sample - (alpha_t * (torch.exp(-h) - 1.0)) * model_output
+            expm1_neg_h = torch.expm1(-h)  # More numerically stable than exp(-h) - 1.0
+            x_t = (sigma_t / sigma_s) * sample - (alpha_t * expm1_neg_h) * model_output
         elif self.config.algorithm_type == "sde-dpmsolver++":
             assert noise is not None
+            exp_neg_h = torch.exp(-h)
+            exp_neg2h = torch.exp(-2.0 * h)
             x_t = (
-                (sigma_t / sigma_s * torch.exp(-h)) * sample
-                + (alpha_t * (1 - torch.exp(-2.0 * h))) * model_output
-                + sigma_t * torch.sqrt(1.0 - torch.exp(-2 * h)) * noise
+                (sigma_t / sigma_s * exp_neg_h) * sample
+                + (alpha_t * (1 - exp_neg2h)) * model_output
+                + sigma_t * torch.sqrt(1.0 - exp_neg2h) * noise
             )
-
         return x_t
 
     def multistep_dpm_solver_second_order_update(
