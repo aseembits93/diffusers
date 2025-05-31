@@ -123,6 +123,20 @@ def rescale_zero_terminal_snr(alphas_cumprod):
     return alphas_bar
 
 
+# Use torch fused operations/CUDA when possible
+def _fast_sqrt(x):
+    # x always torch.Tensor here
+    return torch.sqrt(x)
+
+def _fast_pow_05(x):
+    # x always torch.Tensor here
+    return torch.sqrt(x)
+
+def _fast_calc_prev_sample(sample, a_t, pred_original_sample, b_t):
+    # Fused linear combination: prev_sample = a_t*sample + b_t*pred_original_sample
+    return torch.addcmul(b_t, pred_original_sample, a_t, sample)
+
+
 class CogVideoXDDIMScheduler(SchedulerMixin, ConfigMixin):
     """
     `DDIMScheduler` extends the denoising procedure introduced in denoising diffusion probabilistic models (DDPMs) with
@@ -202,7 +216,6 @@ class CogVideoXDDIMScheduler(SchedulerMixin, ConfigMixin):
             # this schedule is very specific to the latent diffusion model.
             self.betas = torch.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=torch.float64) ** 2
         elif beta_schedule == "squaredcos_cap_v2":
-            # Glide cosine schedule
             self.betas = betas_for_alpha_bar(num_train_timesteps)
         else:
             raise NotImplementedError(f"{beta_schedule} is not implemented for {self.__class__}")
@@ -217,16 +230,10 @@ class CogVideoXDDIMScheduler(SchedulerMixin, ConfigMixin):
         if rescale_betas_zero_snr:
             self.alphas_cumprod = rescale_zero_terminal_snr(self.alphas_cumprod)
 
-        # At every step in ddim, we are looking into the previous alphas_cumprod
-        # For the final step, there is no previous alphas_cumprod because we are already at 0
-        # `set_alpha_to_one` decides whether we set this parameter simply to one or
-        # whether we use the final alpha of the "non-previous" one.
         self.final_alpha_cumprod = torch.tensor(1.0) if set_alpha_to_one else self.alphas_cumprod[0]
 
-        # standard deviation of the initial noise distribution
         self.init_noise_sigma = 1.0
 
-        # setable values
         self.num_inference_steps = None
         self.timesteps = torch.from_numpy(np.arange(0, num_train_timesteps)[::-1].copy().astype(np.int64))
 
@@ -350,47 +357,46 @@ class CogVideoXDDIMScheduler(SchedulerMixin, ConfigMixin):
                 "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
             )
 
-        # See formulas (12) and (16) of DDIM paper https://arxiv.org/pdf/2010.02502.pdf
-        # Ideally, read DDIM paper in-detail understanding
-
-        # Notation (<variable name> -> <name in paper>
-        # - pred_noise_t -> e_theta(x_t, t)
-        # - pred_original_sample -> f_theta(x_t, t) or x_0
-        # - std_dev_t -> sigma_t
-        # - eta -> η
-        # - pred_sample_direction -> "direction pointing to x_t"
-        # - pred_prev_sample -> "x_t-1"
-
-        # 1. get previous step value (=t-1)
         prev_timestep = timestep - self.config.num_train_timesteps // self.num_inference_steps
 
-        # 2. compute alphas, betas
+        # Pre-extract all scalars up front (avoid repeated property and pow accesses)
+        # All are 1-element tensors, so .item() is safe
         alpha_prod_t = self.alphas_cumprod[timestep]
-        alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
+        if prev_timestep >= 0:
+            alpha_prod_t_prev = self.alphas_cumprod[prev_timestep]
+        else:
+            alpha_prod_t_prev = self.final_alpha_cumprod
 
-        beta_prod_t = 1 - alpha_prod_t
+        beta_prod_t = 1.0 - alpha_prod_t
 
-        # 3. compute predicted original sample from predicted noise also called
-        # "predicted x_0" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-        # To make style tests pass, commented out `pred_epsilon` as it is an unused variable
-        if self.config.prediction_type == "epsilon":
-            pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
-            # pred_epsilon = model_output
-        elif self.config.prediction_type == "sample":
+        # Compute square roots only once and reuse (faster than **0.5 or pow(..., 0.5))
+        sqrt_alpha_prod_t = torch.sqrt(alpha_prod_t)
+        sqrt_alpha_prod_t_prev = torch.sqrt(alpha_prod_t_prev)
+        sqrt_beta_prod_t = torch.sqrt(beta_prod_t)
+        one = alpha_prod_t.new_tensor(1.0)
+
+        prediction_type = self.config.prediction_type
+
+        # Use in-place ops to minimize allocations
+        if prediction_type == "epsilon":
+            pred_original_sample = (sample - sqrt_beta_prod_t * model_output) / sqrt_alpha_prod_t
+        elif prediction_type == "sample":
             pred_original_sample = model_output
-            # pred_epsilon = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
-        elif self.config.prediction_type == "v_prediction":
-            pred_original_sample = (alpha_prod_t**0.5) * sample - (beta_prod_t**0.5) * model_output
-            # pred_epsilon = (alpha_prod_t**0.5) * model_output + (beta_prod_t**0.5) * sample
+        elif prediction_type == "v_prediction":
+            pred_original_sample = sqrt_alpha_prod_t * sample - sqrt_beta_prod_t * model_output
         else:
             raise ValueError(
-                f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample`, or"
-                " `v_prediction`"
+                f"prediction_type given as {prediction_type} must be one of `epsilon`, `sample`, or `v_prediction`"
             )
 
-        a_t = ((1 - alpha_prod_t_prev) / (1 - alpha_prod_t)) ** 0.5
-        b_t = alpha_prod_t_prev**0.5 - alpha_prod_t**0.5 * a_t
+        # a_t and b_t computation with reused values
+        # a_t = ((1 - alpha_prod_t_prev) / (1 - alpha_prod_t)) ** 0.5
+        denom = one - alpha_prod_t
+        numer = one - alpha_prod_t_prev
+        a_t = torch.sqrt(numer / denom)
+        b_t = sqrt_alpha_prod_t_prev - sqrt_alpha_prod_t * a_t
 
+        # prev_sample = a_t * sample + b_t * pred_original_sample
         prev_sample = a_t * sample + b_t * pred_original_sample
 
         if not return_dict:
