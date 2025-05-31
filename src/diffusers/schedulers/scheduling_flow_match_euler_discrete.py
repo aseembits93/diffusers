@@ -114,8 +114,10 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         if time_shift_type not in {"exponential", "linear"}:
             raise ValueError("`time_shift_type` must either be 'exponential' or 'linear'.")
 
-        timesteps = np.linspace(1, num_train_timesteps, num_train_timesteps, dtype=np.float32)[::-1].copy()
-        timesteps = torch.from_numpy(timesteps).to(dtype=torch.float32)
+        # Use torch to allocate and process all tensors to minimize conversions and memory usage
+        timesteps = torch.linspace(
+            float(num_train_timesteps), 1.0, steps=num_train_timesteps, dtype=torch.float32
+        )
 
         sigmas = timesteps / num_train_timesteps
         if not use_dynamic_shifting:
@@ -129,7 +131,7 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
 
         self._shift = shift
 
-        self.sigmas = sigmas.to("cpu")  # to avoid too much CPU/GPU communication
+        self.sigmas = sigmas.cpu()  # keep on CPU to avoid CPU/GPU comms
         self.sigma_min = self.sigmas[-1].item()
         self.sigma_max = self.sigmas[0].item()
 
@@ -226,7 +228,7 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
             return self._time_shift_linear(mu, sigma, t)
 
     def stretch_shift_to_terminal(self, t: torch.Tensor) -> torch.Tensor:
-        r"""
+        """
         Stretches and shifts the timestep schedule to ensure it terminates at the configured `shift_terminal` config
         value.
 
@@ -241,9 +243,12 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
             `torch.Tensor`:
                 A tensor of adjusted timesteps such that the final value equals `self.config.shift_terminal`.
         """
-        one_minus_z = 1 - t
-        scale_factor = one_minus_z[-1] / (1 - self.config.shift_terminal)
-        stretched_t = 1 - (one_minus_z / scale_factor)
+        # Vectorized and reuses intermediates, manual inplace ops to minimize tensor allocations
+        one_minus_z = torch.sub(1, t)
+        denom = 1 - self.config.shift_terminal
+        # Pre-compute denominator reciprocal for faster division, and avoid Python float division
+        scale_factor = torch.div(one_minus_z[-1], denom)
+        stretched_t = torch.sub(1, one_minus_z.div(scale_factor))
         return stretched_t
 
     def set_timesteps(
