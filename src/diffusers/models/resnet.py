@@ -743,43 +743,49 @@ class AlphaBlender(nn.Module):
         if merge_strategy not in self.strategies:
             raise ValueError(f"merge_strategy needs to be in {self.strategies}")
 
+        # Use torch.as_tensor for compatibility/eager memory allocation, make sure device matches real runs
         if self.merge_strategy == "fixed":
-            self.register_buffer("mix_factor", torch.Tensor([alpha]))
+            self.register_buffer("mix_factor", torch.as_tensor([alpha], dtype=torch.float32))
         elif self.merge_strategy == "learned" or self.merge_strategy == "learned_with_images":
-            self.register_parameter("mix_factor", torch.nn.Parameter(torch.Tensor([alpha])))
+            self.register_parameter("mix_factor", nn.Parameter(torch.as_tensor([alpha], dtype=torch.float32)))
         else:
             raise ValueError(f"Unknown merge strategy {self.merge_strategy}")
 
     def get_alpha(self, image_only_indicator: torch.Tensor, ndims: int) -> torch.Tensor:
         if self.merge_strategy == "fixed":
-            alpha = self.mix_factor
+            # Buffer, no computation needed
+            return self.mix_factor
 
         elif self.merge_strategy == "learned":
-            alpha = torch.sigmoid(self.mix_factor)
+            # Sigmoid only needed here, direct return
+            return torch.sigmoid(self.mix_factor)
 
         elif self.merge_strategy == "learned_with_images":
             if image_only_indicator is None:
                 raise ValueError("Please provide image_only_indicator to use learned_with_images merge strategy")
-
+            # Compute once (sigmoid/mix_factor)
+            sig_alpha = torch.sigmoid(self.mix_factor)
+            device = image_only_indicator.device
+            ones = torch.ones(1, 1, device=device, dtype=sig_alpha.dtype)
+            # Condition for each batch element
             alpha = torch.where(
                 image_only_indicator.bool(),
-                torch.ones(1, 1, device=image_only_indicator.device),
-                torch.sigmoid(self.mix_factor)[..., None],
+                ones,
+                sig_alpha[..., None],
             )
-
             # (batch, channel, frames, height, width)
             if ndims == 5:
-                alpha = alpha[:, None, :, None, None]
+                # Ensure output shape matches expected tensor, avoids extra copies
+                return alpha.unsqueeze(1).unsqueeze(3).unsqueeze(4)
             # (batch*frames, height*width, channels)
             elif ndims == 3:
-                alpha = alpha.reshape(-1)[:, None, None]
+                # Avoid .reshape by ensuring correct column dims up front
+                return alpha.view(-1, 1, 1)
             else:
                 raise ValueError(f"Unexpected ndims {ndims}. Dimensions should be 3 or 5")
 
         else:
             raise NotImplementedError
-
-        return alpha
 
     def forward(
         self,
