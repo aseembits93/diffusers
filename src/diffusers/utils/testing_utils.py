@@ -273,9 +273,7 @@ def require_torch_2(test_case):
     """
     Decorator marking a test that requires PyTorch 2. These tests are skipped when it isn't installed.
     """
-    return unittest.skipUnless(is_torch_available() and is_torch_version(">=", "2.0.0"), "test requires PyTorch 2")(
-        test_case
-    )
+    return unittest.skipUnless(not _torch2_skip, "test requires PyTorch 2")(test_case)
 
 
 def require_torch_version_greater_equal(torch_version):
@@ -1377,3 +1375,5 @@ class Expectations(DevicePropertiesUserDict):
 
     def __repr__(self):
         return f"{self.data}"
+
+_torch2_skip = not (is_torch_available() and is_torch_version(">=", "2.0.0"))
