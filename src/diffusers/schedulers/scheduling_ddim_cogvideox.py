@@ -230,12 +230,29 @@ class CogVideoXDDIMScheduler(SchedulerMixin, ConfigMixin):
         self.num_inference_steps = None
         self.timesteps = torch.from_numpy(np.arange(0, num_train_timesteps)[::-1].copy().astype(np.int64))
 
-    def _get_variance(self, timestep, prev_timestep):
-        alpha_prod_t = self.alphas_cumprod[timestep]
-        alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
-        beta_prod_t = 1 - alpha_prod_t
-        beta_prod_t_prev = 1 - alpha_prod_t_prev
+        # Precompute and cache useful values for variance calculation to speed up _get_variance()
+        # These are small, 1D torch tensors (few thousand length) and do not add meaningful memory overhead
+        self._beta_prod = 1 - self.alphas_cumprod
+        # To handle the scalar case for self.final_alpha_cumprod, also cache value
+        self._final_alpha_cumprod = self.final_alpha_cumprod
+        self._cached_one = torch.tensor(1.0, dtype=self.alphas_cumprod.dtype, device=self.alphas_cumprod.device)
 
+    def _get_variance(self, timestep, prev_timestep):
+        # Fast lookup from cached vectors, avoids repeated subtraction and Tensor creation
+        alphas_cumprod = self.alphas_cumprod
+        beta_prod = self._beta_prod
+
+        alpha_prod_t = alphas_cumprod[timestep]
+        if prev_timestep >= 0:
+            alpha_prod_t_prev = alphas_cumprod[prev_timestep]
+            beta_prod_t_prev = beta_prod[prev_timestep]
+        else:
+            alpha_prod_t_prev = self._final_alpha_cumprod
+            beta_prod_t_prev = self._cached_one - self._final_alpha_cumprod
+
+        beta_prod_t = beta_prod[timestep]
+
+        # Compute variance (all single-value tensor ops)
         variance = (beta_prod_t_prev / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_t_prev)
 
         return variance
