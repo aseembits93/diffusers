@@ -259,7 +259,8 @@ def is_torch_compile(test_case):
     Compile tests are skipped by default. Set the RUN_COMPILE environment variable to a truthy value to run them.
 
     """
-    return unittest.skipUnless(_run_compile_tests, "test is torch compile")(test_case)
+    # Cache skipUnless decorator to avoid recreating the decorator each time
+    return _skip_torch_compile(test_case)
 
 
 def require_torch(test_case):
@@ -1377,3 +1378,5 @@ class Expectations(DevicePropertiesUserDict):
 
     def __repr__(self):
         return f"{self.data}"
+
+_skip_torch_compile = unittest.skipUnless(_run_compile_tests, "test is torch compile")
