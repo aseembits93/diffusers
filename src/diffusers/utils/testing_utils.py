@@ -8,7 +8,6 @@ import multiprocessing
 import os
 import random
 import re
-import struct
 import sys
 import tempfile
 import time
@@ -693,8 +692,10 @@ def export_to_gif(image: List[PIL.Image.Image], output_gif_path: str = None) -> 
 @contextmanager
 def buffered_writer(raw_f):
     f = io.BufferedWriter(raw_f)
-    yield f
-    f.flush()
+    try:
+        yield f
+    finally:
+        f.flush()
 
 
 def export_to_ply(mesh, output_ply_path: str = None):
@@ -702,49 +703,51 @@ def export_to_ply(mesh, output_ply_path: str = None):
     Write a PLY file for a mesh.
     """
     if output_ply_path is None:
-        output_ply_path = tempfile.NamedTemporaryFile(suffix=".ply").name
+        # Use delete=False to avoid auto-deletion before writing
+        tmp = tempfile.NamedTemporaryFile(suffix=".ply", delete=False)
+        output_ply_path = tmp.name
+        tmp.close()
 
     coords = mesh.verts.detach().cpu().numpy()
     faces = mesh.faces.cpu().numpy()
-    rgb = np.stack([mesh.vertex_channels[x].detach().cpu().numpy() for x in "RGB"], axis=1)
+    # Get R, G, B (assuming they all exist; code requires them)
+    rgb_channels = [mesh.vertex_channels[x].detach().cpu().numpy() for x in "RGB"]
+    rgb = np.stack(rgb_channels, axis=1)
+    rgb = (rgb * 255.499).round().astype(np.uint8)
 
     with buffered_writer(open(output_ply_path, "wb")) as f:
-        f.write(b"ply\n")
-        f.write(b"format binary_little_endian 1.0\n")
-        f.write(bytes(f"element vertex {len(coords)}\n", "ascii"))
-        f.write(b"property float x\n")
-        f.write(b"property float y\n")
-        f.write(b"property float z\n")
-        if rgb is not None:
-            f.write(b"property uchar red\n")
-            f.write(b"property uchar green\n")
-            f.write(b"property uchar blue\n")
-        if faces is not None:
-            f.write(bytes(f"element face {len(faces)}\n", "ascii"))
-            f.write(b"property list uchar int vertex_index\n")
-        f.write(b"end_header\n")
+        # Write PLY header (in one write call where possible)
+        lines = [
+            "ply\n",
+            "format binary_little_endian 1.0\n",
+            f"element vertex {coords.shape[0]}\n",
+            "property float x\n",
+            "property float y\n",
+            "property float z\n",
+            "property uchar red\n",
+            "property uchar green\n",
+            "property uchar blue\n",
+            f"element face {faces.shape[0]}\n",
+            "property list uchar int vertex_index\n",
+            "end_header\n"
+        ]
+        f.write("".join(lines).encode("ascii"))
 
-        if rgb is not None:
-            rgb = (rgb * 255.499).round().astype(int)
-            vertices = [
-                (*coord, *rgb)
-                for coord, rgb in zip(
-                    coords.tolist(),
-                    rgb.tolist(),
-                )
-            ]
-            format = struct.Struct("<3f3B")
-            for item in vertices:
-                f.write(format.pack(*item))
-        else:
-            format = struct.Struct("<3f")
-            for vertex in coords.tolist():
-                f.write(format.pack(*vertex))
+        # Write vertex data efficiently with numpy
+        vertex_data = np.column_stack((coords, rgb))
+        # struct: <3f3B (little-endian: 3 float32 + 3 uint8) -- fill in a pad uint8 for itemsize 15 bytes each row
+        # We'll use numpy's tofile for fast bulk writing.
+        arr = np.empty((coords.shape[0],), dtype=[('x', '<f4'),('y','<f4'),('z','<f4'),('r','u1'),('g','u1'),('b','u1')])
+        arr['x'], arr['y'], arr['z'], arr['r'], arr['g'], arr['b'] = \
+            vertex_data[:,0], vertex_data[:,1], vertex_data[:,2], vertex_data[:,3], vertex_data[:,4], vertex_data[:,5]
+        f.write(arr.tobytes())
 
-        if faces is not None:
-            format = struct.Struct("<B3I")
-            for tri in faces.tolist():
-                f.write(format.pack(len(tri), *tri))
+        # Write face data efficiently (always triangles in shape (N,3))
+        # First byte: 3 (uchar, number of vertex indices), then 3x int32 indices
+        face_block = np.empty((faces.shape[0],), dtype=[('n', 'u1'), ('i0', '<i4'), ('i1', '<i4'), ('i2', '<i4')])
+        face_block['n'] = 3
+        face_block['i0'], face_block['i1'], face_block['i2'] = faces[:,0], faces[:,1], faces[:,2]
+        f.write(face_block.tobytes())
 
     return output_ply_path
 
