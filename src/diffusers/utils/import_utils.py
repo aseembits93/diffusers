@@ -29,6 +29,8 @@ from huggingface_hub.utils import is_jinja_available  # noqa: F401
 from packaging.version import Version, parse
 
 from . import logging
+import importlib_metadata
+import importlib.metadata as importlib_metadata
 
 
 # The package importlib_metadata is in a different place, depending on the python version.
@@ -589,12 +591,26 @@ def compare_versions(library_or_version: Union[str, Version], operation: str, re
         requirement_version (`str`):
             The version to compare the library version against
     """
-    if operation not in STR_OPERATION_TO_FUNC.keys():
+    # Optimize key test to avoid creating intermediate dict view
+    op_func = STR_OPERATION_TO_FUNC.get(operation)
+    if op_func is None:
         raise ValueError(f"`operation` must be one of {list(STR_OPERATION_TO_FUNC.keys())}, received {operation}")
-    operation = STR_OPERATION_TO_FUNC[operation]
+    # Avoid constructing new Version objects and repeated parsing
     if isinstance(library_or_version, str):
-        library_or_version = parse(importlib_metadata.version(library_or_version))
-    return operation(library_or_version, parse(requirement_version))
+        # Cache parsed results for repeated library queries
+        lib_version_str = library_or_version
+        try:
+            lib_version_val = _from_str_parse_cache[lib_version_str]
+        except KeyError:
+            lib_version_val = _fast_parse(importlib_metadata.version(lib_version_str))
+    else:
+        lib_version_val = library_or_version
+    # Cache parsed requirement version for performance
+    try:
+        req_version_val = _req_ver_parse_cache[requirement_version]
+    except KeyError:
+        req_version_val = _fast_req_parse(requirement_version)
+    return op_func(lib_version_val, req_version_val)
 
 
 # This function was copied from: https://github.com/huggingface/accelerate/blob/874c4967d94badd24f893064cc3bef45f57cadf7/src/accelerate/utils/versions.py#L338
@@ -668,7 +684,21 @@ def is_accelerate_version(operation: str, version: str):
     """
     if not _accelerate_available:
         return False
-    return compare_versions(parse(_accelerate_version), operation, version)
+    # Only parse _accelerate_version once and cache its string parse
+    # Use the caches for version parse
+    try:
+        acc_ver = _from_str_parse_cache[_accelerate_version]
+    except KeyError:
+        acc_ver = _fast_parse(_accelerate_version)
+    # Cache requirement version parse as well
+    try:
+        req_ver = _req_ver_parse_cache[version]
+    except KeyError:
+        req_ver = _fast_req_parse(version)
+    op_func = STR_OPERATION_TO_FUNC.get(operation)
+    if op_func is None:
+        raise ValueError(f"`operation` must be one of {list(STR_OPERATION_TO_FUNC.keys())}, received {operation}")
+    return op_func(acc_ver, req_ver)
 
 
 def is_peft_version(operation: str, version: str):
@@ -780,6 +810,24 @@ def get_objects_from_module(module):
 
     return objects
 
+def _fast_parse(version: str):
+    """Helper function for cached version parsing."""
+    # parse is fast for new objects, but caching avoids many repeated calls
+    v = _from_str_parse_cache.get(version)
+    if v is not None:
+        return v
+    v = parse(version)
+    _from_str_parse_cache[version] = v
+    return v
+
+def _fast_req_parse(version: str):
+    v = _req_ver_parse_cache.get(version)
+    if v is not None:
+        return v
+    v = parse(version)
+    _req_ver_parse_cache[version] = v
+    return v
+
 
 class OptionalDependencyNotAvailable(BaseException):
     """
@@ -845,3 +893,7 @@ class _LazyModule(ModuleType):
 
     def __reduce__(self):
         return (self.__class__, (self._name, self.__file__, self._import_structure))
+
+_from_str_parse_cache = {}
+
+_req_ver_parse_cache = {}
