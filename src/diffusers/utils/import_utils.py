@@ -29,6 +29,8 @@ from huggingface_hub.utils import is_jinja_available  # noqa: F401
 from packaging.version import Version, parse
 
 from . import logging
+import importlib_metadata
+import importlib.metadata as importlib_metadata
 
 
 # The package importlib_metadata is in a different place, depending on the python version.
@@ -589,12 +591,22 @@ def compare_versions(library_or_version: Union[str, Version], operation: str, re
         requirement_version (`str`):
             The version to compare the library version against
     """
-    if operation not in STR_OPERATION_TO_FUNC.keys():
+    # --- Hot path speedups below ---
+    op_func = STR_OPERATION_TO_FUNC.get(operation, None)
+    if op_func is None:
         raise ValueError(f"`operation` must be one of {list(STR_OPERATION_TO_FUNC.keys())}, received {operation}")
-    operation = STR_OPERATION_TO_FUNC[operation]
-    if isinstance(library_or_version, str):
-        library_or_version = parse(importlib_metadata.version(library_or_version))
-    return operation(library_or_version, parse(requirement_version))
+
+    # Bypass isinstance check if already Version.
+    if type(library_or_version) is str:
+        # Fetch version string from distribution if it's a library name, else parse directly
+        version_str = importlib_metadata.version(library_or_version)
+        left = _parse_version_cached(version_str)
+    else:
+        left = library_or_version
+
+    right = _parse_version_cached(requirement_version)
+
+    return op_func(left, right)
 
 
 # This function was copied from: https://github.com/huggingface/accelerate/blob/874c4967d94badd24f893064cc3bef45f57cadf7/src/accelerate/utils/versions.py#L338
@@ -608,7 +620,11 @@ def is_torch_version(operation: str, version: str):
         version (`str`):
             A string version of PyTorch
     """
-    return compare_versions(parse(_torch_version), operation, version)
+    global _torch_version_parsed
+    if _torch_version_parsed is None:
+        # Only parse _torch_version once
+        _torch_version_parsed = _parse_version_cached(_torch_version)
+    return compare_versions(_torch_version_parsed, operation, version)
 
 
 def is_torch_xla_version(operation: str, version: str):
@@ -780,6 +796,12 @@ def get_objects_from_module(module):
 
     return objects
 
+def _parse_version_cached(version_str):
+    # Helper to cache parsed Version objects for string inputs
+    if version_str not in _VERSION_PARSE_CACHE:
+        _VERSION_PARSE_CACHE[version_str] = parse(version_str)
+    return _VERSION_PARSE_CACHE[version_str]
+
 
 class OptionalDependencyNotAvailable(BaseException):
     """
@@ -845,3 +867,7 @@ class _LazyModule(ModuleType):
 
     def __reduce__(self):
         return (self.__class__, (self._name, self.__file__, self._import_structure))
+
+_VERSION_PARSE_CACHE = {}
+
+_torch_version_parsed = None
