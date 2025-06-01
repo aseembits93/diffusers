@@ -29,6 +29,8 @@ from huggingface_hub.utils import is_jinja_available  # noqa: F401
 from packaging.version import Version, parse
 
 from . import logging
+import importlib_metadata
+import importlib.metadata as importlib_metadata
 
 
 # The package importlib_metadata is in a different place, depending on the python version.
@@ -589,12 +591,19 @@ def compare_versions(library_or_version: Union[str, Version], operation: str, re
         requirement_version (`str`):
             The version to compare the library version against
     """
-    if operation not in STR_OPERATION_TO_FUNC.keys():
-        raise ValueError(f"`operation` must be one of {list(STR_OPERATION_TO_FUNC.keys())}, received {operation}")
-    operation = STR_OPERATION_TO_FUNC[operation]
+    # Fast membership test against static set instead of dict_keys
+    if operation not in _STR_OPERATION_TO_FUNC_KEYS:
+        raise ValueError(f"`operation` must be one of {list(_STR_OPERATION_TO_FUNC_KEYS)}, received {operation}")
+    op_func = STR_OPERATION_TO_FUNC[operation]
     if isinstance(library_or_version, str):
+        # Only call parse if not already a Version obj for extra speed.
         library_or_version = parse(importlib_metadata.version(library_or_version))
-    return operation(library_or_version, parse(requirement_version))
+    # Use version parse cache if possible
+    rv = _parse_version_cache.get(requirement_version)
+    if rv is None:
+        rv = parse(requirement_version)
+        _parse_version_cache[requirement_version] = rv
+    return op_func(library_or_version, rv)
 
 
 # This function was copied from: https://github.com/huggingface/accelerate/blob/874c4967d94badd24f893064cc3bef45f57cadf7/src/accelerate/utils/versions.py#L338
@@ -638,7 +647,11 @@ def is_transformers_version(operation: str, version: str):
     """
     if not _transformers_available:
         return False
-    return compare_versions(parse(_transformers_version), operation, version)
+    # Cache parse(_transformers_version) for repeated use
+    global _parse_transformers_version_cache
+    if _parse_transformers_version_cache is None:
+        _parse_transformers_version_cache = parse(_transformers_version)
+    return compare_versions(_parse_transformers_version_cache, operation, version)
 
 
 def is_hf_hub_version(operation: str, version: str):
@@ -845,3 +858,9 @@ class _LazyModule(ModuleType):
 
     def __reduce__(self):
         return (self.__class__, (self._name, self.__file__, self._import_structure))
+
+_STR_OPERATION_TO_FUNC_KEYS = set(STR_OPERATION_TO_FUNC.keys())
+
+_parse_transformers_version_cache = None
+
+_parse_version_cache = {}
