@@ -60,10 +60,13 @@ class OobleckResidualUnit(nn.Module):
 
     def __init__(self, dimension: int = 16, dilation: int = 1):
         super().__init__()
-        pad = ((7 - 1) * dilation) // 2
+        self.dilation = dilation
+        self.kernel_size = 7
+        # Precompute padding amount for conv1 and reuse
+        self.pad = ((self.kernel_size - 1) * dilation) // 2
 
         self.snake1 = Snake1d(dimension)
-        self.conv1 = weight_norm(nn.Conv1d(dimension, dimension, kernel_size=7, dilation=dilation, padding=pad))
+        self.conv1 = weight_norm(nn.Conv1d(dimension, dimension, kernel_size=self.kernel_size, dilation=dilation, padding=self.pad))
         self.snake2 = Snake1d(dimension)
         self.conv2 = weight_norm(nn.Conv1d(dimension, dimension, kernel_size=1))
 
@@ -79,15 +82,26 @@ class OobleckResidualUnit(nn.Module):
             output_tensor (`torch.Tensor` of shape `(batch_size, channels, time_steps)`)
                 Input tensor after passing through the residual unit.
         """
-        output_tensor = hidden_state
-        output_tensor = self.conv1(self.snake1(output_tensor))
-        output_tensor = self.conv2(self.snake2(output_tensor))
+        # Fast path: don't copy input, operate directly
+        x = hidden_state
+        x = self.snake1(x)
+        x = self.conv1(x)
+        x = self.snake2(x)
+        x = self.conv2(x)
 
-        padding = (hidden_state.shape[-1] - output_tensor.shape[-1]) // 2
-        if padding > 0:
-            hidden_state = hidden_state[..., padding:-padding]
-        output_tensor = hidden_state + output_tensor
-        return output_tensor
+        # Padding correction only if needed (very rarely)
+        seq_diff = hidden_state.shape[-1] - x.shape[-1]
+        if seq_diff == 0:
+            out = hidden_state + x
+        elif seq_diff > 0:
+            pad = seq_diff // 2
+            out = hidden_state[..., pad:-pad] + x
+        else:
+            # This branch is unlikely, but for correctness
+            pad = (-seq_diff) // 2
+            out = hidden_state + x[..., pad:-pad]
+
+        return out
 
 
 class OobleckEncoderBlock(nn.Module):
