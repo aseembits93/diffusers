@@ -167,27 +167,51 @@ def compute_dream_and_update_latents(
     Returns:
         `tuple[torch.Tensor, torch.Tensor]`: Adjusted noisy_latents and target.
     """
-    alphas_cumprod = noise_scheduler.alphas_cumprod.to(timesteps.device)[timesteps, None, None, None]
-    sqrt_one_minus_alphas_cumprod = (1.0 - alphas_cumprod) ** 0.5
 
-    # The paper uses lambda = sqrt(1 - alpha) ** p, with p = 1 in their experiments.
-    dream_lambda = sqrt_one_minus_alphas_cumprod**dream_detail_preservation
+    # Fast-fail for alternate prediction types before doing expensive math.
+    prediction_type = noise_scheduler.config.prediction_type
+    if prediction_type == "v_prediction":
+        raise NotImplementedError("DREAM has not been implemented for v-prediction")
+    if prediction_type != "epsilon":
+        raise ValueError(f"Unknown prediction type {prediction_type}")
 
-    pred = None
+    # Gather alphas_cumprod efficiently
+    acp = noise_scheduler.alphas_cumprod
+    # Detect whether acp is on proper device/dtype already.
+    expd = timesteps.device
+    dtyp = noisy_latents.dtype
+    # Only move if needed
+    if acp.device != expd or acp.dtype != dtyp:
+        acp = acp.to(device=expd, dtype=dtyp, non_blocking=True)
+
+    # Use index_select for efficient selection and avoid repeated [None, None, None]
+    alphas_cumprod = acp.index_select(0, timesteps)  # shape: (batch,)
+    # Unsqueeze once for broadcast; safer than [None, None, None] indexing
+    alphas_cumprod = alphas_cumprod.view(-1, 1, 1, 1)
+
+    # Compute 1 - alpha, sqrt and combine detail preservation in one go
+    one_minus_alphas = 1.0 - alphas_cumprod
+    sqrt_one_minus_alphas = torch.sqrt(one_minus_alphas)
+    # dream_lambda = (sqrt(1 - alpha)) ** p
+    dream_lambda = sqrt_one_minus_alphas.pow(dream_detail_preservation)
+
+    # U-Net prediction, outside grad for memory
     with torch.no_grad():
         pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
-    _noisy_latents, _target = (None, None)
-    if noise_scheduler.config.prediction_type == "epsilon":
-        predicted_noise = pred
-        delta_noise = (noise - predicted_noise).detach()
-        delta_noise.mul_(dream_lambda)
-        _noisy_latents = noisy_latents.add(sqrt_one_minus_alphas_cumprod * delta_noise)
-        _target = target.add(delta_noise)
-    elif noise_scheduler.config.prediction_type == "v_prediction":
-        raise NotImplementedError("DREAM has not been implemented for v-prediction")
-    else:
-        raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+    # The following is now "epsilon" only, so skip the branching.
+    # Minimize allocations: do as much in-place as safe
+    predicted_noise = pred
+    # Avoid .detach() if unnecessary, but let's assume grad not needed.
+    delta_noise = (noise - predicted_noise)
+    if delta_noise.requires_grad:
+        delta_noise = delta_noise.detach()
+    delta_noise.mul_(dream_lambda)  # In-place for efficiency
+
+    # Compute adjusted latents and targets reusing memory
+    # sqrt_one_minus_alphas_cumprod * delta_noise can be done as out = delta_noise * sqrt_one_minus_alphas
+    _noisy_latents = noisy_latents + sqrt_one_minus_alphas * delta_noise
+    _target = target + delta_noise
 
     return _noisy_latents, _target
 
