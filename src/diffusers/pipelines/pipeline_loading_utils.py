@@ -43,6 +43,7 @@ from ..utils import (
 )
 from ..utils.torch_utils import is_compiled_module
 from .transformers_loading_utils import _load_tokenizer_from_dduf, _load_transformers_model_from_dduf
+from transformers.utils import FLAX_WEIGHTS_NAME as TRANSFORMERS_FLAX_WEIGHTS_NAME, SAFE_WEIGHTS_NAME as TRANSFORMERS_SAFE_WEIGHTS_NAME, WEIGHTS_NAME as TRANSFORMERS_WEIGHTS_NAME
 
 
 if is_transformers_available():
@@ -143,6 +144,7 @@ def is_safetensors_compatible(filenames, passed_components=None, folder_names=No
 
 def filter_model_files(filenames):
     """Filter model repo files for just files/folders that contain model weights"""
+    # Prepare allowed weight filenames
     weight_names = [
         WEIGHTS_NAME,
         SAFETENSORS_WEIGHTS_NAME,
@@ -152,11 +154,20 @@ def filter_model_files(filenames):
     ]
 
     if is_transformers_available():
-        weight_names += [TRANSFORMERS_WEIGHTS_NAME, TRANSFORMERS_SAFE_WEIGHTS_NAME, TRANSFORMERS_FLAX_WEIGHTS_NAME]
+        weight_names += [
+            TRANSFORMERS_WEIGHTS_NAME,
+            TRANSFORMERS_SAFE_WEIGHTS_NAME,
+            TRANSFORMERS_FLAX_WEIGHTS_NAME,
+        ]
 
-    allowed_extensions = [wn.split(".")[-1] for wn in weight_names]
+    # Precompute allowed unique extensions, using set to avoid duplicates
+    allowed_extensions = {'.' + wn.split(".", 1)[-1] if '.' in wn else "" for wn in weight_names}
 
-    return [f for f in filenames if any(f.endswith(extension) for extension in allowed_extensions)]
+    # Build one tuple to use in str.endswith for better performance
+    endswith_tuple = tuple(allowed_extensions)
+
+    # Return files that end with an allowed extension
+    return [f for f in filenames if f.endswith(endswith_tuple)]
 
 
 def variant_compatible_siblings(filenames, variant=None, ignore_patterns=None) -> Union[List[os.PathLike], str]:
