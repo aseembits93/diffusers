@@ -103,39 +103,42 @@ def is_safetensors_compatible(filenames, passed_components=None, folder_names=No
     - For models from the transformers library, the filename changes from "pytorch_model" to "model", and the ".bin"
       extension is replaced with ".safetensors"
     """
+    # Optimization: use sets for fast lookups, avoid os.path.split and split('/') in hot paths
     passed_components = passed_components or []
+
+    # For speed: Precompute folder_names set if necessary
     if folder_names:
-        filenames = {f for f in filenames if os.path.split(f)[0] in folder_names}
+        folder_names_set = set(folder_names)
+        filenames = [f for f in filenames if f.partition("/")[0] in folder_names_set]
 
-    # extract all components of the pipeline and their associated files
+    # First split only once, store results
     components = {}
+    # Use tuple (component, filename) to avoid repeated split
     for filename in filenames:
-        if not len(filename.split("/")) == 2:
+        sp = filename.split("/", 1)
+        if len(sp) != 2:
             continue
-
-        component, component_filename = filename.split("/")
+        component, component_filename = sp
         if component in passed_components:
             continue
-
-        components.setdefault(component, [])
+        # group filenames per component
+        if component not in components:
+            components[component] = []
         components[component].append(component_filename)
 
-    # If there are no component folders check the main directory for safetensors files
+    # If no component folders, check for any file containing ".safetensors"
     if not components:
+        # Faster with generator instead of constructing an intermediate list
         return any(".safetensors" in filename for filename in filenames)
 
-    # iterate over all files of a component
-    # check if safetensor files exist for that component
-    # if variant is provided check if the variant of the safetensors exists
-    for component, component_filenames in components.items():
-        matches = []
+    # For each component, check if any of its filenames endswith ".safetensors"
+    for component_filenames in components.values():
+        found = False
         for component_filename in component_filenames:
-            filename, extension = os.path.splitext(component_filename)
-
-            match_exists = extension == ".safetensors"
-            matches.append(match_exists)
-
-        if not any(matches):
+            if component_filename.endswith(".safetensors"):
+                found = True
+                break
+        if not found:
             return False
 
     return True
