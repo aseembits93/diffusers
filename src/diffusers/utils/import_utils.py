@@ -29,6 +29,8 @@ from huggingface_hub.utils import is_jinja_available  # noqa: F401
 from packaging.version import Version, parse
 
 from . import logging
+import importlib_metadata
+import importlib.metadata as importlib_metadata
 
 
 # The package importlib_metadata is in a different place, depending on the python version.
@@ -589,12 +591,20 @@ def compare_versions(library_or_version: Union[str, Version], operation: str, re
         requirement_version (`str`):
             The version to compare the library version against
     """
-    if operation not in STR_OPERATION_TO_FUNC.keys():
+    # Fast path for exact keys check
+    try:
+        op_func = STR_OPERATION_TO_FUNC[operation]
+    except KeyError:
         raise ValueError(f"`operation` must be one of {list(STR_OPERATION_TO_FUNC.keys())}, received {operation}")
-    operation = STR_OPERATION_TO_FUNC[operation]
+
     if isinstance(library_or_version, str):
         library_or_version = parse(importlib_metadata.version(library_or_version))
-    return operation(library_or_version, parse(requirement_version))
+    # Use cached requirement version (Version object) if available
+    v2 = __requirement_version_cache.get(requirement_version)
+    if v2 is None:
+        v2 = parse(requirement_version)
+        __requirement_version_cache[requirement_version] = v2
+    return op_func(library_or_version, v2)
 
 
 # This function was copied from: https://github.com/huggingface/accelerate/blob/874c4967d94badd24f893064cc3bef45f57cadf7/src/accelerate/utils/versions.py#L338
@@ -742,7 +752,10 @@ def is_k_diffusion_version(operation: str, version: str):
     """
     if not _k_diffusion_available:
         return False
-    return compare_versions(parse(_k_diffusion_version), operation, version)
+    global __k_diffusion_version_parsed
+    if __k_diffusion_version_parsed is None:
+        __k_diffusion_version_parsed = parse(_k_diffusion_version)
+    return compare_versions(__k_diffusion_version_parsed, operation, version)
 
 
 def is_optimum_quanto_version(operation: str, version: str):
@@ -845,3 +858,7 @@ class _LazyModule(ModuleType):
 
     def __reduce__(self):
         return (self.__class__, (self._name, self.__file__, self._import_structure))
+
+__requirement_version_cache = {}
+
+__k_diffusion_version_parsed = None
