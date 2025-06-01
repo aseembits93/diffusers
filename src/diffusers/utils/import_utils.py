@@ -796,17 +796,15 @@ class _LazyModule(ModuleType):
     # https://github.com/optuna/optuna/blob/master/optuna/integration/__init__.py
     def __init__(self, name, module_file, import_structure, module_spec=None, extra_objects=None):
         super().__init__(name)
-        self._modules = set(import_structure.keys())
-        self._class_to_module = {}
-        for key, values in import_structure.items():
-            for value in values:
-                self._class_to_module[value] = key
-        # Needed for autocompletion in an IDE
-        self.__all__ = list(import_structure.keys()) + list(chain(*import_structure.values()))
+        self._modules = set(import_structure)
+        # Use dict comprehension for class-to-module mapping, reduce number of operations
+        self._class_to_module = {value: key for key, values in import_structure.items() for value in values}
+        # Inline __all__ building to avoid temporaries
+        self.__all__ = [*import_structure.keys(), *(value for values in import_structure.values() for value in values)]
         self.__file__ = module_file
         self.__spec__ = module_spec
         self.__path__ = [os.path.dirname(module_file)]
-        self._objects = {} if extra_objects is None else extra_objects
+        self._objects = extra_objects if extra_objects is not None else {}
         self._name = name
         self._import_structure = import_structure
 
@@ -844,4 +842,5 @@ class _LazyModule(ModuleType):
             ) from e
 
     def __reduce__(self):
+        # This method is already highly optimized and simple, no further speedup possible.
         return (self.__class__, (self._name, self.__file__, self._import_structure))
