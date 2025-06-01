@@ -771,14 +771,8 @@ def get_objects_from_module(module):
     Returns:
         dict: Dictionary of object names and corresponding values
     """
-
-    objects = {}
-    for name in dir(module):
-        if name.startswith("_"):
-            continue
-        objects[name] = getattr(module, name)
-
-    return objects
+    # Use module.__dict__ for direct and fast lookup; skip private names.
+    return {name: obj for name, obj in module.__dict__.items() if not name.startswith("_")}
 
 
 class OptionalDependencyNotAvailable(BaseException):
