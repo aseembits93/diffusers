@@ -43,6 +43,7 @@ from ..utils import (
 )
 from ..utils.torch_utils import is_compiled_module
 from .transformers_loading_utils import _load_tokenizer_from_dduf, _load_transformers_model_from_dduf
+from peft import PeftModel
 
 
 if is_transformers_available():
@@ -290,15 +291,14 @@ def warn_deprecated_model_variant(pretrained_model_name_or_path, token, variant,
 
 def _unwrap_model(model):
     """Unwraps a model."""
+    # Early-out for compiled modules
     if is_compiled_module(model):
         model = model._orig_mod
 
-    if is_peft_available():
-        from peft import PeftModel
-
+    # Early-out if PEFT unavailable, avoiding unnecessary checks/imports
+    if PeftModel is not None and is_peft_available():
         if isinstance(model, PeftModel):
             model = model.base_model.model
-
     return model
 
 
@@ -1078,3 +1078,5 @@ def _maybe_raise_error_for_incorrect_transformers(config_dict):
                 break
     if has_transformers_component and not is_transformers_version(">", "4.47.1"):
         raise ValueError("Please upgrade your `transformers` installation to the latest version to use DDUF.")
+
+PeftModel = None
