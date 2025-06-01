@@ -29,6 +29,9 @@ from huggingface_hub.utils import is_jinja_available  # noqa: F401
 from packaging.version import Version, parse
 
 from . import logging
+import importlib_metadata
+import importlib.metadata as importlib_metadata
+from functools import lru_cache
 
 
 # The package importlib_metadata is in a different place, depending on the python version.
@@ -589,12 +592,14 @@ def compare_versions(library_or_version: Union[str, Version], operation: str, re
         requirement_version (`str`):
             The version to compare the library version against
     """
-    if operation not in STR_OPERATION_TO_FUNC.keys():
+    # Optimization: Avoid creating keys(), using 'in' directly on dict is faster
+    if operation not in STR_OPERATION_TO_FUNC:
         raise ValueError(f"`operation` must be one of {list(STR_OPERATION_TO_FUNC.keys())}, received {operation}")
-    operation = STR_OPERATION_TO_FUNC[operation]
+    op_func = STR_OPERATION_TO_FUNC[operation]
     if isinstance(library_or_version, str):
         library_or_version = parse(importlib_metadata.version(library_or_version))
-    return operation(library_or_version, parse(requirement_version))
+    # Optimization: Cache parse of requirement_version
+    return op_func(library_or_version, _cached_parse(requirement_version))
 
 
 # This function was copied from: https://github.com/huggingface/accelerate/blob/874c4967d94badd24f893064cc3bef45f57cadf7/src/accelerate/utils/versions.py#L338
@@ -653,7 +658,10 @@ def is_hf_hub_version(operation: str, version: str):
     """
     if not _hf_hub_available:
         return False
-    return compare_versions(parse(_hf_hub_version), operation, version)
+    # Optimization: Cache parsing of _hf_hub_version also, if large number of calls
+    # This will not cache repeated calls for different _hf_hub_version values
+    # In most use, _hf_hub_version will be static per process.
+    return compare_versions(_cached_parse(_hf_hub_version), operation, version)
 
 
 def is_accelerate_version(operation: str, version: str):
@@ -779,6 +787,11 @@ def get_objects_from_module(module):
         objects[name] = getattr(module, name)
 
     return objects
+
+
+@lru_cache(maxsize=512)
+def _cached_parse(version: str):
+    return parse(version)
 
 
 class OptionalDependencyNotAvailable(BaseException):
