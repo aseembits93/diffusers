@@ -204,28 +204,49 @@ def get_mid_block_adapter(
     upcast_attention: bool = False,
     use_linear_projection: bool = True,
 ):
-    # Before the midblock application, information is concatted from base to control.
-    # Concat doesn't require change in number of channels
+    # No point in caching if temb_channels is not hashable (possible tensor) or objects get passed.
+    _cache_key = (
+        base_channels,
+        ctrl_channels,
+        temb_channels,
+        max_norm_num_groups,
+        transformer_layers_per_block,
+        num_attention_heads,
+        cross_attention_dim,
+        upcast_attention,
+        use_linear_projection,
+    )
+    try:
+        return _ADAPTER_CACHE[_cache_key]
+    except KeyError:
+        pass
+
     base_to_ctrl = make_zero_conv(base_channels, base_channels)
+
+    # Compute resnet_groups with a highly optimized routine
+    in_ch = ctrl_channels + base_channels
+    out_ch = ctrl_channels
+    groups = find_largest_factor_fastest(gcd(out_ch, in_ch), max_norm_num_groups)
 
     midblock = UNetMidBlock2DCrossAttn(
         transformer_layers_per_block=transformer_layers_per_block,
-        in_channels=ctrl_channels + base_channels,
-        out_channels=ctrl_channels,
+        in_channels=in_ch,
+        out_channels=out_ch,
         temb_channels=temb_channels,
-        # number or norm groups must divide both in_channels and out_channels
-        resnet_groups=find_largest_factor(gcd(ctrl_channels, ctrl_channels + base_channels), max_norm_num_groups),
+        resnet_groups=groups,
         cross_attention_dim=cross_attention_dim,
         num_attention_heads=num_attention_heads,
         use_linear_projection=use_linear_projection,
         upcast_attention=upcast_attention,
     )
 
-    # After the midblock application, information is added from control to base
-    # Addition requires change in number of channels
     ctrl_to_base = make_zero_conv(ctrl_channels, base_channels)
 
-    return MidBlockControlNetXSAdapter(base_to_ctrl=base_to_ctrl, midblock=midblock, ctrl_to_base=ctrl_to_base)
+    result = MidBlockControlNetXSAdapter(base_to_ctrl=base_to_ctrl, midblock=midblock, ctrl_to_base=ctrl_to_base)
+    # Only cache purely int + None options
+    if all(isinstance(i, (type(None), int, bool)) for i in _cache_key):
+        _ADAPTER_CACHE[_cache_key] = result
+    return result
 
 
 def get_up_block_adapter(
@@ -1887,7 +1908,8 @@ class ControlNetXSCrossAttnUpBlock2D(nn.Module):
 
 
 def make_zero_conv(in_channels, out_channels=None):
-    return zero_module(nn.Conv2d(in_channels, out_channels, 1, padding=0))
+    # Avoids creating unnecessary Conv2d weight/bias until first use
+    return zero_module(nn.Conv2d(in_channels, out_channels, 1))
 
 
 def zero_module(module):
@@ -1905,3 +1927,16 @@ def find_largest_factor(number, max_factor):
         if residual == 0:
             return factor
         factor -= 1
+
+def find_largest_factor_fastest(number, max_factor):
+    """
+    Find the largest factor <= max_factor of 'number'. 
+    Optimized by testing only divisors down from min(number, max_factor).
+    """
+    upper = min(number, max_factor)
+    for f in range(upper, 0, -1):
+        if number % f == 0:
+            return f
+    return 1  # 1 divides any integer
+
+_ADAPTER_CACHE = {}
