@@ -201,7 +201,6 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
         elif beta_schedule == "linear":
             self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
         elif beta_schedule == "scaled_linear":
-            # this schedule is very specific to the latent diffusion model.
             self.betas = torch.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=torch.float32) ** 2
         elif beta_schedule == "squaredcos_cap_v2":
             # Glide cosine schedule
@@ -525,21 +524,31 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
         return noisy_samples
 
     def get_velocity(self, sample: torch.Tensor, noise: torch.Tensor, timesteps: torch.IntTensor) -> torch.Tensor:
-        # Make sure alphas_cumprod and timestep have same device and dtype as sample
-        self.alphas_cumprod = self.alphas_cumprod.to(device=sample.device)
-        alphas_cumprod = self.alphas_cumprod.to(dtype=sample.dtype)
-        timesteps = timesteps.to(sample.device)
+        # Optimized for fewer allocations/copies, avoid repeated to() and unsqueezing
+        device = sample.device
+        dtype = sample.dtype
 
-        sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
-        sqrt_alpha_prod = sqrt_alpha_prod.flatten()
-        while len(sqrt_alpha_prod.shape) < len(sample.shape):
-            sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
+        # Ensure alphas_cumprod is on the right device/dtype only if needed
+        acp = self.alphas_cumprod
+        if acp.device != device:
+            acp = acp.to(device)
+        if acp.dtype != dtype:
+            acp = acp.to(dtype=dtype)
 
-        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
-        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
-        while len(sqrt_one_minus_alpha_prod.shape) < len(sample.shape):
-            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+        # Timesteps on correct device
+        if timesteps.device != device:
+            timesteps = timesteps.to(device)
 
+        # Pick out alpha_cumprod for the given timesteps
+        # Compute shapes to enable simple broadcasting rather than using .flatten() and slow loops
+        # Always expand (N,) -> (N,1,1,...) to match sample.shape
+        target_shape = [timesteps.shape[0]] + [1] * (sample.dim() - 1)
+
+        acp_index = acp.index_select(0, timesteps).reshape(target_shape)
+        sqrt_alpha_prod = acp_index.sqrt()
+        sqrt_one_minus_alpha_prod = (1.0 - acp_index).sqrt()
+
+        # Direct broadcasting through natively-shaped tensors; torch will broadcast as needed
         velocity = sqrt_alpha_prod * noise - sqrt_one_minus_alpha_prod * sample
         return velocity
 
