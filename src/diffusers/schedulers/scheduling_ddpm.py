@@ -102,25 +102,21 @@ def rescale_zero_terminal_snr(betas):
     Returns:
         `torch.Tensor`: rescaled betas with zero terminal SNR
     """
-    # Convert betas to alphas_bar_sqrt
     alphas = 1.0 - betas
     alphas_cumprod = torch.cumprod(alphas, dim=0)
     alphas_bar_sqrt = alphas_cumprod.sqrt()
 
     # Store old values.
-    alphas_bar_sqrt_0 = alphas_bar_sqrt[0].clone()
-    alphas_bar_sqrt_T = alphas_bar_sqrt[-1].clone()
+    alphas_bar_sqrt_0 = alphas_bar_sqrt[0]
+    alphas_bar_sqrt_T = alphas_bar_sqrt[-1]
 
-    # Shift so the last timestep is zero.
-    alphas_bar_sqrt -= alphas_bar_sqrt_T
-
-    # Scale so the first timestep is back to the old value.
-    alphas_bar_sqrt *= alphas_bar_sqrt_0 / (alphas_bar_sqrt_0 - alphas_bar_sqrt_T)
+    # Combined subtraction and scaling (only creates 1 intermediate tensor)
+    scale = alphas_bar_sqrt_0 / (alphas_bar_sqrt_0 - alphas_bar_sqrt_T)
+    alphas_bar_sqrt = (alphas_bar_sqrt - alphas_bar_sqrt_T) * scale
 
     # Convert alphas_bar_sqrt to betas
-    alphas_bar = alphas_bar_sqrt**2  # Revert sqrt
-    alphas = alphas_bar[1:] / alphas_bar[:-1]  # Revert cumprod
-    alphas = torch.cat([alphas_bar[0:1], alphas])
+    alphas_bar = alphas_bar_sqrt.square()    # more efficient than **2 for Tensor
+    alphas = torch.cat((alphas_bar[0:1], alphas_bar[1:] / alphas_bar[:-1]))
     betas = 1 - alphas
 
     return betas
