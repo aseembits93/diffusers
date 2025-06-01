@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
@@ -89,7 +88,7 @@ def retrieve_timesteps(
     sigmas: Optional[List[float]] = None,
     **kwargs,
 ):
-    r"""
+    """
     Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
     custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
 
@@ -114,30 +113,45 @@ def retrieve_timesteps(
     """
     if timesteps is not None and sigmas is not None:
         raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
+    cls = type(scheduler)
     if timesteps is not None:
-        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        # --- Optimized: Cache parameter set per scheduler class ---
+        accepts_timesteps = "timesteps" in _get_set_timesteps_param_set(cls)
         if not accepts_timesteps:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
                 f" timestep schedules. Please check whether you are using the correct scheduler."
             )
         scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
+        timesteps_ret = scheduler.timesteps
+        num_inference_steps = len(timesteps_ret)
     elif sigmas is not None:
-        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        accept_sigmas = "sigmas" in _get_set_timesteps_param_set(cls)
         if not accept_sigmas:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
                 f" sigmas schedules. Please check whether you are using the correct scheduler."
             )
         scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
+        timesteps_ret = scheduler.timesteps
+        num_inference_steps = len(timesteps_ret)
     else:
         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-    return timesteps, num_inference_steps
+        timesteps_ret = scheduler.timesteps
+    return timesteps_ret, num_inference_steps
+
+
+# --- Optimized helper cache for parameter signature inspection ---
+def _get_set_timesteps_param_set(cls):
+    # Cache the parameter set per class for faster lookup (parameter list doesn't change at runtime)
+    if not hasattr(cls, "_param_set_cache"):
+        try:
+            import inspect
+            param_set = set(inspect.signature(cls.set_timesteps).parameters.keys())
+        except Exception:
+            param_set = set()
+        cls._param_set_cache = param_set
+    return cls._param_set_cache
 
 
 class LTXPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraLoaderMixin):
