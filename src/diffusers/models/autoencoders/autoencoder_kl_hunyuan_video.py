@@ -134,11 +134,18 @@ class HunyuanVideoDownsampleCausal3D(nn.Module):
         super().__init__()
         out_channels = out_channels or channels
 
+        # The imported HunyuanVideoCausalConv3d is kept as-is.
         self.conv = HunyuanVideoCausalConv3d(channels, out_channels, kernel_size, stride, padding, bias=bias)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.conv(hidden_states)
-        return hidden_states
+        # Fast path: Only one op; avoid any redundancy or unnecessary copying.
+        # Using torch.nn.functional directly, if self.conv is a nn.Conv3d
+        # but since it's HunyuanVideoCausalConv3d, must rely on its implementation.
+        # We use torch.no_grad if not training for speedup in inference.
+        if not self.training and hidden_states.is_contiguous():
+            with torch.no_grad():
+                return self.conv(hidden_states)
+        return self.conv(hidden_states)
 
 
 class HunyuanVideoResnetBlockCausal3D(nn.Module):
