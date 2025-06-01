@@ -101,7 +101,7 @@ EXAMPLE_DOC_STRING = """
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.rescale_noise_cfg
 def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
-    r"""
+    """
     Rescales `noise_cfg` tensor based on `guidance_rescale` to improve image quality and fix overexposure. Based on
     Section 3.4 from [Common Diffusion Noise Schedules and Sample Steps are
     Flawed](https://arxiv.org/pdf/2305.08891.pdf).
@@ -117,10 +117,18 @@ def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
     Returns:
         noise_cfg (`torch.Tensor`): The rescaled noise prediction tensor.
     """
-    std_text = noise_pred_text.std(dim=list(range(1, noise_pred_text.ndim)), keepdim=True)
-    std_cfg = noise_cfg.std(dim=list(range(1, noise_cfg.ndim)), keepdim=True)
+    # Early return if no rescaling is required
+    if guidance_rescale == 0.0:
+        return noise_cfg
+    # precompute the tuple of axes to avoid list(range()) overhead
+    axes = tuple(range(1, noise_pred_text.ndim))
+    std_text = noise_pred_text.std(dim=axes, keepdim=True)
+    std_cfg = noise_cfg.std(dim=axes, keepdim=True)
     # rescale the results from guidance (fixes overexposure)
     noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
+    # Early return for full rescaling
+    if guidance_rescale == 1.0:
+        return noise_pred_rescaled
     # mix with the original results from guidance by factor guidance_rescale to avoid "plain looking" images
     noise_cfg = guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
     return noise_cfg
