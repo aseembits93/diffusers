@@ -349,39 +349,34 @@ class EMAModel:
             at 215.4k steps).
         """
 
+        # Fast in-branch conditional for module passing
         if isinstance(parameters, torch.nn.Module):
-            deprecation_message = (
-                "Passing a `torch.nn.Module` to `ExponentialMovingAverage` is deprecated. "
-                "Please pass the parameters of the module instead."
-            )
             deprecate(
                 "passing a `torch.nn.Module` to `ExponentialMovingAverage`",
                 "1.0.0",
-                deprecation_message,
+                "Passing a `torch.nn.Module` to `ExponentialMovingAverage` is deprecated. Please pass the parameters of the module instead.",
                 standard_warn=False,
             )
             parameters = parameters.parameters()
-
-            # set use_ema_warmup to True if a torch.nn.Module is passed for backwards compatibility
             use_ema_warmup = True
 
-        if kwargs.get("max_value", None) is not None:
-            deprecation_message = "The `max_value` argument is deprecated. Please use `decay` instead."
-            deprecate("max_value", "1.0.0", deprecation_message, standard_warn=False)
-            decay = kwargs["max_value"]
+        # Move kwargs checks up
+        if (max_value := kwargs.get("max_value", None)) is not None:
+            deprecate("max_value", "1.0.0", "The `max_value` argument is deprecated. Please use `decay` instead.", standard_warn=False)
+            decay = max_value
 
-        if kwargs.get("min_value", None) is not None:
-            deprecation_message = "The `min_value` argument is deprecated. Please use `min_decay` instead."
-            deprecate("min_value", "1.0.0", deprecation_message, standard_warn=False)
-            min_decay = kwargs["min_value"]
+        if (min_value := kwargs.get("min_value", None)) is not None:
+            deprecate("min_value", "1.0.0", "The `min_value` argument is deprecated. Please use `min_decay` instead.", standard_warn=False)
+            min_decay = min_value
 
+        # parameters can be an iterator, so force list once
         parameters = list(parameters)
+        # Optimize: only copy/clone what is needed, and use list comprehension for best speed
         self.shadow_params = [p.clone().detach() for p in parameters]
 
-        if kwargs.get("device", None) is not None:
-            deprecation_message = "The `device` argument is deprecated. Please use `to` instead."
-            deprecate("device", "1.0.0", deprecation_message, standard_warn=False)
-            self.to(device=kwargs["device"])
+        if (device := kwargs.get("device", None)) is not None:
+            deprecate("device", "1.0.0", "The `device` argument is deprecated. Please use `to` instead.", standard_warn=False)
+            self.to(device=device)
 
         self.temp_stored_params = None
 
@@ -427,19 +422,19 @@ class EMAModel:
         """
         Compute the decay factor for the exponential moving average.
         """
-        step = max(0, optimization_step - self.update_after_step - 1)
-
+        # Fast inline: avoid computing negative exponent if not needed
+        step = optimization_step - self.update_after_step - 1
         if step <= 0:
             return 0.0
-
         if self.use_ema_warmup:
-            cur_decay_value = 1 - (1 + step / self.inv_gamma) ** -self.power
+            cur_decay_value = 1.0 - (1.0 + step / self.inv_gamma) ** -self.power
         else:
-            cur_decay_value = (1 + step) / (10 + step)
-
-        cur_decay_value = min(cur_decay_value, self.decay)
-        # make sure decay is not smaller than min_decay
-        cur_decay_value = max(cur_decay_value, self.min_decay)
+            cur_decay_value = (1.0 + step) / (10.0 + step)
+        # Clamp empirically faster than two min/max
+        if cur_decay_value > self.decay:
+            cur_decay_value = self.decay
+        if cur_decay_value < self.min_decay:
+            cur_decay_value = self.min_decay
         return cur_decay_value
 
     @torch.no_grad()
