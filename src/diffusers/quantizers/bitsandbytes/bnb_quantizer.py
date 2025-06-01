@@ -18,8 +18,9 @@ https://github.com/huggingface/transformers/blob/c409cd81777fb27aadc043ed3d8339d
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
-from ...utils import get_module_from_name
+from ...utils import logging, get_module_from_name
 from ..base import DiffusersQuantizer
+import torch
 
 
 if TYPE_CHECKING:
@@ -409,17 +410,26 @@ class BnB8BitDiffusersQuantizer(DiffusersQuantizer):
     # Copied from diffusers.quantizers.bitsandbytes.bnb_quantizer.BnB4BitDiffusersQuantizer.update_device_map
     def update_device_map(self, device_map):
         if device_map is None:
-            if torch.xpu.is_available():
-                current_device = f"xpu:{torch.xpu.current_device()}"
+            # Use local variable bindings for slight speed up
+            xpu_mod = torch.xpu
+            cuda_mod = torch.cuda
+            # Query available device only once per call and use cached string format
+            if xpu_mod.is_available():
+                dev = xpu_mod.current_device()
+                current_device = f"xpu:{dev}"
             else:
-                current_device = f"cuda:{torch.cuda.current_device()}"
+                dev = cuda_mod.current_device()
+                current_device = f"cuda:{dev}"
             device_map = {"": current_device}
-            logger.info(
-                "The device_map was not initialized. "
-                "Setting device_map to {"
-                ": {current_device}}. "
-                "If you want to use the model for inference, please set device_map ='auto' "
-            )
+            # Avoid expensive f-string in logger, only format if logging is enabled
+            if logger.isEnabledFor(logging.INFO):
+                # Only format the log if logging is enabled
+                logger.info(
+                    "The device_map was not initialized. "
+                    "Setting device_map to {'': %s}. "
+                    "If you want to use the model for inference, please set device_map ='auto' ",
+                    current_device
+                )
         return device_map
 
     def adjust_target_dtype(self, target_dtype: "torch.dtype") -> "torch.dtype":
