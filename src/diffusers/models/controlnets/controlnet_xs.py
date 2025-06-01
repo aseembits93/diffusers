@@ -1891,8 +1891,10 @@ def make_zero_conv(in_channels, out_channels=None):
 
 
 def zero_module(module):
-    for p in module.parameters():
-        nn.init.zeros_(p)
+    # Zero out all parameters of the module. (Optimized: use torch.no_grad, call .zero_() directly for speed)
+    with torch.no_grad():
+        for p in module.parameters():
+            p.zero_()
     return module
 
 
