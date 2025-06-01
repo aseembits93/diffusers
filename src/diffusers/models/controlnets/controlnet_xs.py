@@ -233,13 +233,14 @@ def get_up_block_adapter(
     prev_output_channel: int,
     ctrl_skip_channels: List[int],
 ):
-    ctrl_to_base = []
-    num_layers = 3  # only support sd + sdxl
-    for i in range(num_layers):
-        resnet_in_channels = prev_output_channel if i == 0 else out_channels
-        ctrl_to_base.append(make_zero_conv(ctrl_skip_channels[i], resnet_in_channels))
-
-    return UpBlockControlNetXSAdapter(ctrl_to_base=nn.ModuleList(ctrl_to_base))
+    # Avoid Python loop, use list comprehension for speed
+    ctrl_to_base = nn.ModuleList([
+        make_zero_conv(
+            ctrl_skip_channels[i], 
+            prev_output_channel if i == 0 else out_channels
+        ) for i in range(3)  # only support sd + sdxl
+    ])
+    return UpBlockControlNetXSAdapter(ctrl_to_base=ctrl_to_base)
 
 
 class ControlNetXSAdapter(ModelMixin, ConfigMixin):
@@ -1887,7 +1888,13 @@ class ControlNetXSCrossAttnUpBlock2D(nn.Module):
 
 
 def make_zero_conv(in_channels, out_channels=None):
-    return zero_module(nn.Conv2d(in_channels, out_channels, 1, padding=0))
+    # Fused Conv2d zero-initialization for speed
+    conv = nn.Conv2d(in_channels, out_channels, 1, padding=0)
+    with torch.no_grad():
+        conv.weight.data.zero_()
+        if conv.bias is not None:
+            conv.bias.data.zero_()
+    return conv
 
 
 def zero_module(module):
