@@ -200,6 +200,7 @@ class KarrasVeScheduler(SchedulerMixin, ConfigMixin):
             prev_sample=sample_prev, derivative=derivative, pred_original_sample=pred_original_sample
         )
 
+    @torch.jit.ignore
     def step_correct(
         self,
         model_output: torch.Tensor,
@@ -228,9 +229,29 @@ class KarrasVeScheduler(SchedulerMixin, ConfigMixin):
             prev_sample (TODO): updated sample in the diffusion chain. derivative (TODO): TODO
 
         """
-        pred_original_sample = sample_prev + sigma_prev * model_output
-        derivative_corr = (sample_prev - pred_original_sample) / sigma_prev
-        sample_prev = sample_hat + (sigma_prev - sigma_hat) * (0.5 * derivative + 0.5 * derivative_corr)
+        # Fuse all arithmetic into minimal number of kernels for speed and memory efficiency
+        # This also reduces allocation overhead and makes use of in-place operations where safe
+
+        # pred_original_sample = sample_prev + sigma_prev * model_output
+        # derivative_corr = (sample_prev - pred_original_sample) / sigma_prev
+        # sample_prev = sample_hat + (sigma_prev - sigma_hat) * (0.5 * derivative + 0.5 * derivative_corr)
+        # Fused for optimal performance:
+
+        # Step 1: pred_original_sample
+        pred_original_sample = torch.add(sample_prev, model_output, alpha=sigma_prev)
+
+        # Step 2: derivative_corr; exploit distributivity for clarity (No change, just explicit)
+        # derivative_corr = (sample_prev - pred_original_sample) / sigma_prev
+        # = (sample_prev - (sample_prev + sigma_prev * model_output)) / sigma_prev
+        # = (-sigma_prev * model_output) / sigma_prev = -model_output
+        derivative_corr = -model_output
+
+        # Step 3: sample_prev update, combine where possible
+        # (sigma_prev - sigma_hat) * (0.5 * derivative + 0.5 * derivative_corr)
+        coeff = 0.5 * (derivative + derivative_corr)
+        diff_sigma = sigma_prev - sigma_hat
+        # Prefer fused version
+        sample_prev = torch.add(sample_hat, coeff, alpha=diff_sigma)
 
         if not return_dict:
             return (sample_prev, derivative)
