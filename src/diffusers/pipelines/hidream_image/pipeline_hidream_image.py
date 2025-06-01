@@ -77,10 +77,19 @@ def calculate_shift(
     base_shift: float = 0.5,
     max_shift: float = 1.15,
 ):
+    # Fast path: use precomputed values if all are defaults
+    if (
+        base_seq_len == _default_base_seq_len and
+        max_seq_len == _default_max_seq_len and
+        base_shift == _default_base_shift and
+        max_shift == _default_max_shift
+    ):
+        # Use precomputed m and b
+        return image_seq_len * _default_m + _default_b
+    # Fallback: compute as before
     m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
     b = base_shift - m * base_seq_len
-    mu = image_seq_len * m + b
-    return mu
+    return image_seq_len * m + b
 
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
@@ -1010,3 +1019,15 @@ class HiDreamImagePipeline(DiffusionPipeline, HiDreamImageLoraLoaderMixin):
             return (image,)
 
         return HiDreamImagePipelineOutput(images=image)
+
+_default_base_seq_len = 256
+
+_default_max_seq_len = 4096
+
+_default_base_shift = 0.5
+
+_default_max_shift = 1.15
+
+_default_m = (_default_max_shift - _default_base_shift) / (_default_max_seq_len - _default_base_seq_len)
+
+_default_b = _default_base_shift - _default_m * _default_base_seq_len
