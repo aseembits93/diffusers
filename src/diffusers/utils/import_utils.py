@@ -29,6 +29,8 @@ from huggingface_hub.utils import is_jinja_available  # noqa: F401
 from packaging.version import Version, parse
 
 from . import logging
+import importlib_metadata
+import importlib.metadata as importlib_metadata
 
 
 # The package importlib_metadata is in a different place, depending on the python version.
@@ -589,12 +591,15 @@ def compare_versions(library_or_version: Union[str, Version], operation: str, re
         requirement_version (`str`):
             The version to compare the library version against
     """
-    if operation not in STR_OPERATION_TO_FUNC.keys():
+    try:
+        op_func = STR_OPERATION_TO_FUNC[operation]
+    except KeyError:
         raise ValueError(f"`operation` must be one of {list(STR_OPERATION_TO_FUNC.keys())}, received {operation}")
-    operation = STR_OPERATION_TO_FUNC[operation]
+
     if isinstance(library_or_version, str):
-        library_or_version = parse(importlib_metadata.version(library_or_version))
-    return operation(library_or_version, parse(requirement_version))
+        library_or_version = _parse_version_cached(importlib_metadata.version(library_or_version))
+    req_version = _parse_version_cached(requirement_version)
+    return op_func(library_or_version, req_version)
 
 
 # This function was copied from: https://github.com/huggingface/accelerate/blob/874c4967d94badd24f893064cc3bef45f57cadf7/src/accelerate/utils/versions.py#L338
@@ -683,7 +688,8 @@ def is_peft_version(operation: str, version: str):
     """
     if not _peft_available:
         return False
-    return compare_versions(parse(_peft_version), operation, version)
+    # Avoid reparsing _peft_version, which is the main profiler hotspot
+    return compare_versions(_get_parsed_peft_version(), operation, version)
 
 
 def is_bitsandbytes_version(operation: str, version: str):
@@ -779,6 +785,22 @@ def get_objects_from_module(module):
         objects[name] = getattr(module, name)
 
     return objects
+
+# Import STR_OPERATION_TO_FUNC, _peft_available, _peft_version from utils (these are already imported in local namespace)
+
+def _parse_version_cached(version_str, _cache={}):
+    # Use a simple per-process cache for parse() as packaging.version.parse is slow
+    if version_str not in _cache:
+        _cache[version_str] = parse(version_str)
+    return _cache[version_str]
+
+# Cache parsed _peft_version as it is used repeatedly in is_peft_version
+def _get_parsed_peft_version():
+    # _peft_version is a string or None, caching the parsed result
+    # Since _peft_version is imported at the module level, and is static for the process, this is safe.
+    if not hasattr(_get_parsed_peft_version, "_cache"):
+        _get_parsed_peft_version._cache = _parse_version_cached(_peft_version)
+    return _get_parsed_peft_version._cache
 
 
 class OptionalDependencyNotAvailable(BaseException):
