@@ -101,7 +101,7 @@ def retrieve_timesteps(
     sigmas: Optional[List[float]] = None,
     **kwargs,
 ):
-    r"""
+    """
     Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
     custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
 
@@ -127,29 +127,29 @@ def retrieve_timesteps(
     if timesteps is not None and sigmas is not None:
         raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
     if timesteps is not None:
-        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
-        if not accepts_timesteps:
+        # Optimize by caching whether the method supports 'timesteps'
+        if not _supports_timesteps(scheduler):
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
                 f" timestep schedules. Please check whether you are using the correct scheduler."
             )
         scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
+        timesteps_out = scheduler.timesteps
+        num_inference_steps = len(timesteps_out)
     elif sigmas is not None:
-        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
-        if not accept_sigmas:
+        # Optimize by caching whether the method supports 'sigmas'
+        if not _supports_sigmas(scheduler):
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
                 f" sigmas schedules. Please check whether you are using the correct scheduler."
             )
         scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
+        timesteps_out = scheduler.timesteps
+        num_inference_steps = len(timesteps_out)
     else:
         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-    return timesteps, num_inference_steps
+        timesteps_out = scheduler.timesteps
+    return timesteps_out, num_inference_steps
 
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.retrieve_latents
@@ -164,6 +164,26 @@ def retrieve_latents(
         return encoder_output.latents
     else:
         raise AttributeError("Could not access latents of provided encoder_output")
+
+def _supports_timesteps(scheduler):
+    scheduler_class = type(scheduler)
+    if scheduler_class not in _TIMESTEP_SUPPORT_CACHE:
+        try:
+            params = inspect.signature(scheduler.set_timesteps).parameters
+            _TIMESTEP_SUPPORT_CACHE[scheduler_class] = "timesteps" in params
+        except Exception:
+            _TIMESTEP_SUPPORT_CACHE[scheduler_class] = False
+    return _TIMESTEP_SUPPORT_CACHE[scheduler_class]
+
+def _supports_sigmas(scheduler):
+    scheduler_class = type(scheduler)
+    if scheduler_class not in _SIGMAS_SUPPORT_CACHE:
+        try:
+            params = inspect.signature(scheduler.set_timesteps).parameters
+            _SIGMAS_SUPPORT_CACHE[scheduler_class] = "sigmas" in params
+        except Exception:
+            _SIGMAS_SUPPORT_CACHE[scheduler_class] = False
+    return _SIGMAS_SUPPORT_CACHE[scheduler_class]
 
 
 class CogVideoXVideoToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
@@ -865,3 +885,7 @@ class CogVideoXVideoToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
             return (video,)
 
         return CogVideoXPipelineOutput(frames=video)
+
+_TIMESTEP_SUPPORT_CACHE = {}
+
+_SIGMAS_SUPPORT_CACHE = {}
