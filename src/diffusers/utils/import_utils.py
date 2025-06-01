@@ -29,6 +29,8 @@ from huggingface_hub.utils import is_jinja_available  # noqa: F401
 from packaging.version import Version, parse
 
 from . import logging
+import importlib_metadata
+import importlib.metadata as importlib_metadata
 
 
 # The package importlib_metadata is in a different place, depending on the python version.
@@ -589,12 +591,18 @@ def compare_versions(library_or_version: Union[str, Version], operation: str, re
         requirement_version (`str`):
             The version to compare the library version against
     """
-    if operation not in STR_OPERATION_TO_FUNC.keys():
+    # Use set for O(1) membership check and avoid .keys() call
+    if operation not in STR_OPERATION_TO_FUNC:
         raise ValueError(f"`operation` must be one of {list(STR_OPERATION_TO_FUNC.keys())}, received {operation}")
-    operation = STR_OPERATION_TO_FUNC[operation]
+    op_func = STR_OPERATION_TO_FUNC[operation]
+
     if isinstance(library_or_version, str):
-        library_or_version = parse(importlib_metadata.version(library_or_version))
-    return operation(library_or_version, parse(requirement_version))
+        # Avoid unnecessary parse() if already cached
+        # Also, avoid double parse on repeated calls
+        version_str = importlib_metadata.version(library_or_version)
+        library_or_version = _cached_parse(version_str)
+    # Cache requirement version parses as well
+    return op_func(library_or_version, _cached_parse(requirement_version))
 
 
 # This function was copied from: https://github.com/huggingface/accelerate/blob/874c4967d94badd24f893064cc3bef45f57cadf7/src/accelerate/utils/versions.py#L338
@@ -780,6 +788,12 @@ def get_objects_from_module(module):
 
     return objects
 
+def _cached_parse(version_string):
+    # Helper function to parse version strings or return cached result
+    if version_string not in _version_parse_cache:
+        _version_parse_cache[version_string] = parse(version_string)
+    return _version_parse_cache[version_string]
+
 
 class OptionalDependencyNotAvailable(BaseException):
     """
@@ -845,3 +859,5 @@ class _LazyModule(ModuleType):
 
     def __reduce__(self):
         return (self.__class__, (self._name, self.__file__, self._import_structure))
+
+_version_parse_cache = {}
