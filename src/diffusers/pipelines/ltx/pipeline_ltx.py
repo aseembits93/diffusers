@@ -177,7 +177,6 @@ class LTXPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraLoaderMixi
         transformer: LTXVideoTransformer3DModel,
     ):
         super().__init__()
-
         self.register_modules(
             vae=vae,
             text_encoder=text_encoder,
@@ -186,23 +185,13 @@ class LTXPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraLoaderMixi
             scheduler=scheduler,
         )
 
-        self.vae_spatial_compression_ratio = (
-            self.vae.spatial_compression_ratio if getattr(self, "vae", None) is not None else 32
-        )
-        self.vae_temporal_compression_ratio = (
-            self.vae.temporal_compression_ratio if getattr(self, "vae", None) is not None else 8
-        )
-        self.transformer_spatial_patch_size = (
-            self.transformer.config.patch_size if getattr(self, "transformer", None) is not None else 1
-        )
-        self.transformer_temporal_patch_size = (
-            self.transformer.config.patch_size_t if getattr(self, "transformer") is not None else 1
-        )
-
+        # Use direct attribute access for efficiency, assuming valid non-None objects are always passed in init.
+        self.vae_spatial_compression_ratio = vae.spatial_compression_ratio
+        self.vae_temporal_compression_ratio = vae.temporal_compression_ratio
+        self.transformer_spatial_patch_size = transformer.config.patch_size
+        self.transformer_temporal_patch_size = transformer.config.patch_size_t
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_spatial_compression_ratio)
-        self.tokenizer_max_length = (
-            self.tokenizer.model_max_length if getattr(self, "tokenizer", None) is not None else 128
-        )
+        self.tokenizer_max_length = tokenizer.model_max_length
 
     def _get_t5_prompt_embeds(
         self,
@@ -391,25 +380,19 @@ class LTXPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraLoaderMixi
 
     @staticmethod
     def _pack_latents(latents: torch.Tensor, patch_size: int = 1, patch_size_t: int = 1) -> torch.Tensor:
-        # Unpacked latents of shape are [B, C, F, H, W] are patched into tokens of shape [B, C, F // p_t, p_t, H // p, p, W // p, p].
-        # The patch dimensions are then permuted and collapsed into the channel dimension of shape:
-        # [B, F // p_t * H // p * W // p, C * p_t * p * p] (an ndim=3 tensor).
-        # dim=0 is the batch size, dim=1 is the effective video sequence length, dim=2 is the effective number of input features
-        batch_size, num_channels, num_frames, height, width = latents.shape
-        post_patch_num_frames = num_frames // patch_size_t
-        post_patch_height = height // patch_size
-        post_patch_width = width // patch_size
+        # Optimized patching: less attribute queries and more explicit shapes.
+        b, c, f, h, w = latents.shape
+        pt, p = patch_size_t, patch_size
+        f_out, h_out, w_out = f // pt, h // p, w // p
+        # Reshape in one go, permute, then merge last dims. Avoid .flatten(-1) for clarity.
         latents = latents.reshape(
-            batch_size,
-            -1,
-            post_patch_num_frames,
-            patch_size_t,
-            post_patch_height,
-            patch_size,
-            post_patch_width,
-            patch_size,
+            b, c, f_out, pt, h_out, p, w_out, p
         )
-        latents = latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
+        # output shape: [b, c, f_out, pt, h_out, p, w_out, p]
+        latents = latents.permute(0,2,4,6,1,3,5,7)
+        # shape: [b, f_out, h_out, w_out, c, pt, p, p]
+        latents = latents.reshape(b, f_out * h_out * w_out, c * pt * p * p)
+        # shape: [b, effective_seq_length, effective_feature_dim]
         return latents
 
     @staticmethod
