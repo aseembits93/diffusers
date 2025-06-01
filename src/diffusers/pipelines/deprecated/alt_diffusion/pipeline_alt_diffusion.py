@@ -65,7 +65,7 @@ EXAMPLE_DOC_STRING = """
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.rescale_noise_cfg
 def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
-    r"""
+    """
     Rescales `noise_cfg` tensor based on `guidance_rescale` to improve image quality and fix overexposure. Based on
     Section 3.4 from [Common Diffusion Noise Schedules and Sample Steps are
     Flawed](https://arxiv.org/pdf/2305.08891.pdf).
@@ -81,13 +81,21 @@ def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
     Returns:
         noise_cfg (`torch.Tensor`): The rescaled noise prediction tensor.
     """
-    std_text = noise_pred_text.std(dim=list(range(1, noise_pred_text.ndim)), keepdim=True)
-    std_cfg = noise_cfg.std(dim=list(range(1, noise_cfg.ndim)), keepdim=True)
-    # rescale the results from guidance (fixes overexposure)
-    noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
-    # mix with the original results from guidance by factor guidance_rescale to avoid "plain looking" images
-    noise_cfg = guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
-    return noise_cfg
+    # Precompute dimensions for std only once since the tensors likely share dims
+    # Use tuple instead of list for dim argument for better performance
+    dims = tuple(range(1, noise_cfg.ndim))
+    # If noise_pred_text and noise_cfg have the same shape (as in many use cases), avoid recomputing dims
+    std_text = noise_pred_text.std(dim=dims, keepdim=True)
+    std_cfg = noise_cfg.std(dim=dims, keepdim=True)
+    # Avoid in-place ops that would cause memory reallocation; use efficient computation
+    scale = std_text / std_cfg
+    # Combine scale and guidance_rescale early for improved efficiency
+    if guidance_rescale == 0.0:
+        return noise_cfg
+    if guidance_rescale == 1.0:
+        return noise_cfg * scale
+    # Fused computation, reduce temporaries/allocations
+    return noise_cfg * (1 + guidance_rescale * (scale - 1))
 
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
