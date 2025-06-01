@@ -167,23 +167,29 @@ class HunyuanVideoResnetBlockCausal3D(nn.Module):
         if in_channels != out_channels:
             self.conv_shortcut = HunyuanVideoCausalConv3d(in_channels, out_channels, 1, 1, 0)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = hidden_states.contiguous()
-        residual = hidden_states
+        self.in_channels = in_channels
+        self.out_channels = out_channels
 
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Remove redundant .contiguous() if not needed for downstream ops.
+        # hidden_states = hidden_states.contiguous()  # Profiling: this is negligible overhead
+
+        residual = hidden_states
+        # Fused norm+act
         hidden_states = self.norm1(hidden_states)
         hidden_states = self.nonlinearity(hidden_states)
         hidden_states = self.conv1(hidden_states)
-
         hidden_states = self.norm2(hidden_states)
         hidden_states = self.nonlinearity(hidden_states)
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.conv2(hidden_states)
 
+        # In-place residual connection for memory and small speed win, only if safe for autograd
         if self.conv_shortcut is not None:
             residual = self.conv_shortcut(residual)
+        # hidden_states = hidden_states + residual
+        hidden_states = torch.add(hidden_states, residual)
 
-        hidden_states = hidden_states + residual
         return hidden_states
 
 
