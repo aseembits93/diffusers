@@ -99,7 +99,7 @@ def retrieve_timesteps(
     sigmas: Optional[List[float]] = None,
     **kwargs,
 ):
-    r"""
+    """
     Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
     custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
 
@@ -125,7 +125,8 @@ def retrieve_timesteps(
     if timesteps is not None and sigmas is not None:
         raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
     if timesteps is not None:
-        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        # Speedup: use cached param check
+        accepts_timesteps = _scheduler_accepts_param(scheduler, "timesteps")
         if not accepts_timesteps:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
@@ -135,7 +136,8 @@ def retrieve_timesteps(
         timesteps = scheduler.timesteps
         num_inference_steps = len(timesteps)
     elif sigmas is not None:
-        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        # Speedup: use cached param check
+        accept_sigmas = _scheduler_accepts_param(scheduler, "sigmas")
         if not accept_sigmas:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
@@ -148,6 +150,17 @@ def retrieve_timesteps(
         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
         timesteps = scheduler.timesteps
     return timesteps, num_inference_steps
+
+def _scheduler_accepts_param(scheduler, param: str) -> bool:
+    """
+    Helper function to check and cache if scheduler.set_timesteps accepts a parameter.
+    """
+    key = (type(scheduler), param)
+    if key not in _SCHEDULER_SET_TIMESTEPS_ACCEPTS:
+        # inspect.signature is relatively expensive; cache result for each scheduler class+param
+        params = inspect.signature(scheduler.set_timesteps).parameters
+        _SCHEDULER_SET_TIMESTEPS_ACCEPTS[key] = param in params
+    return _SCHEDULER_SET_TIMESTEPS_ACCEPTS[key]
 
 
 class AltDiffusionPipeline(
@@ -988,3 +1001,5 @@ class AltDiffusionPipeline(
             return (image, has_nsfw_concept)
 
         return AltDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+
+_SCHEDULER_SET_TIMESTEPS_ACCEPTS = {}
