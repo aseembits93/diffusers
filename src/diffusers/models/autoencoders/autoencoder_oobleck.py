@@ -36,21 +36,38 @@ class Snake1d(nn.Module):
         super().__init__()
         self.alpha = nn.Parameter(torch.zeros(1, hidden_dim, 1))
         self.beta = nn.Parameter(torch.zeros(1, hidden_dim, 1))
-
-        self.alpha.requires_grad = True
-        self.beta.requires_grad = True
+        # nn.Parameter already sets requires_grad = True
         self.logscale = logscale
 
     def forward(self, hidden_states):
         shape = hidden_states.shape
 
-        alpha = self.alpha if not self.logscale else torch.exp(self.alpha)
-        beta = self.beta if not self.logscale else torch.exp(self.beta)
+        if self.logscale:
+            alpha = torch.exp(self.alpha)
+            beta = torch.exp(self.beta)
+        else:
+            alpha = self.alpha
+            beta = self.beta
 
-        hidden_states = hidden_states.reshape(shape[0], shape[1], -1)
-        hidden_states = hidden_states + (beta + 1e-9).reciprocal() * torch.sin(alpha * hidden_states).pow(2)
-        hidden_states = hidden_states.reshape(shape)
-        return hidden_states
+        # Fuse reshape if needed (to save overhead, only reshape if necessary)
+        if hidden_states.dim() != 3 or hidden_states.shape[1] != alpha.shape[1]:
+            hs = hidden_states.reshape(shape[0], alpha.shape[1], -1)
+        else:
+            hs = hidden_states
+
+        # Precompute inv_beta only once
+        inv_beta = (beta + 1e-9).reciprocal()
+
+        # Compute sin(alpha * hs) and square efficiently
+        out = torch.sin(alpha * hs)
+        out = out * out  # (equiv to .pow(2), but slightly more efficient)
+        out = out * inv_beta  # scaling (broadcasted efficiently)
+        hs = hs + out
+
+        # Only reshape if original shape is not (B, C, L)
+        if hs.shape != shape:
+            hs = hs.reshape(shape)
+        return hs
 
 
 class OobleckResidualUnit(nn.Module):
