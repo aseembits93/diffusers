@@ -43,6 +43,7 @@ from ..utils import (
 )
 from ..utils.torch_utils import is_compiled_module
 from .transformers_loading_utils import _load_tokenizer_from_dduf, _load_transformers_model_from_dduf
+from transformers.utils import FLAX_WEIGHTS_NAME as TRANSFORMERS_FLAX_WEIGHTS_NAME, SAFE_WEIGHTS_NAME as TRANSFORMERS_SAFE_WEIGHTS_NAME, WEIGHTS_NAME as TRANSFORMERS_WEIGHTS_NAME
 
 
 if is_transformers_available():
@@ -160,101 +161,100 @@ def filter_model_files(filenames):
 
 
 def variant_compatible_siblings(filenames, variant=None, ignore_patterns=None) -> Union[List[os.PathLike], str]:
-    weight_names = [
+    # Precompute weight names, prefixes, suffixes
+    base_weight_names = [
         WEIGHTS_NAME,
         SAFETENSORS_WEIGHTS_NAME,
         FLAX_WEIGHTS_NAME,
         ONNX_WEIGHTS_NAME,
         ONNX_EXTERNAL_WEIGHTS_NAME,
     ]
-
+    weight_names = base_weight_names.copy()
     if is_transformers_available():
         weight_names += [TRANSFORMERS_WEIGHTS_NAME, TRANSFORMERS_SAFE_WEIGHTS_NAME, TRANSFORMERS_FLAX_WEIGHTS_NAME]
-
-    # model_pytorch, diffusion_model_pytorch, ...
-    weight_prefixes = [w.split(".")[0] for w in weight_names]
-    # .bin, .safetensors, ...
-    weight_suffixs = [w.split(".")[-1] for w in weight_names]
-    # -00001-of-00002
+    weight_prefixes = tuple(w.split(".", 1)[0] for w in weight_names)
+    weight_suffixs = tuple(w.rsplit(".", 1)[-1] for w in weight_names)
+    weight_prefixes_pattern = '|'.join(weight_prefixes)
+    weight_suffixs_pattern = '|'.join(weight_suffixs)
     transformers_index_format = r"\d{5}-of-\d{5}"
 
+    # Precompile relevant regexes for efficiency
     if variant is not None:
-        # `diffusion_pytorch_model.fp16.bin` as well as `model.fp16-00001-of-00002.safetensors`
         variant_file_re = re.compile(
-            rf"({'|'.join(weight_prefixes)})\.({variant}|{variant}-{transformers_index_format})\.({'|'.join(weight_suffixs)})$"
+            rf"({weight_prefixes_pattern})\.({variant}|{variant}-{transformers_index_format})\.({weight_suffixs_pattern})$"
         )
-        # `text_encoder/pytorch_model.bin.index.fp16.json`
         variant_index_re = re.compile(
-            rf"({'|'.join(weight_prefixes)})\.({'|'.join(weight_suffixs)})\.index\.{variant}\.json$"
+            rf"({weight_prefixes_pattern})\.({weight_suffixs_pattern})\.index\.{variant}\.json$"
         )
         legacy_variant_file_re = re.compile(rf".*-{transformers_index_format}\.{variant}\.[a-z]+$")
         legacy_variant_index_re = re.compile(
-            rf"({'|'.join(weight_prefixes)})\.({'|'.join(weight_suffixs)})\.{variant}\.index\.json$"
+            rf"({weight_prefixes_pattern})\.({weight_suffixs_pattern})\.{variant}\.index\.json$"
         )
-
-    # `diffusion_pytorch_model.bin` as well as `model-00001-of-00002.safetensors`
     non_variant_file_re = re.compile(
-        rf"({'|'.join(weight_prefixes)})(-{transformers_index_format})?\.({'|'.join(weight_suffixs)})$"
+        rf"({weight_prefixes_pattern})(-{transformers_index_format})?\.({weight_suffixs_pattern})$"
     )
-    # `text_encoder/pytorch_model.bin.index.json`
-    non_variant_index_re = re.compile(rf"({'|'.join(weight_prefixes)})\.({'|'.join(weight_suffixs)})\.index\.json")
+    non_variant_index_re = re.compile(
+        rf"({weight_prefixes_pattern})\.({weight_suffixs_pattern})\.index\.json"
+    )
 
-    def filter_for_compatible_extensions(filenames, ignore_patterns=None):
-        if not ignore_patterns:
-            return filenames
+    ignore_exts = set(pat.lstrip("*.") for pat in ignore_patterns) if ignore_patterns else set()
 
-        # ignore patterns uses glob style patterns e.g *.safetensors but we're only
-        # interested in the extension name
-        return {f for f in filenames if not any(f.endswith(pat.lstrip("*.")) for pat in ignore_patterns)}
-
-    def filter_with_regex(filenames, pattern_re):
-        return {f for f in filenames if pattern_re.match(f.split("/")[-1]) is not None}
-
-    # Group files by component
+    # Group files by component (use defaultdict-like pattern for tightness)
     components = {}
     for filename in filenames:
-        if not len(filename.split("/")) == 2:
+        before, sep, after = filename.partition("/")
+        if sep == "":
             components.setdefault("", []).append(filename)
-            continue
+        else:
+            components.setdefault(before, []).append(filename)
 
-        component, _ = filename.split("/")
-        components.setdefault(component, []).append(filename)
+    # Helper: filter filenames by ignore patterns (extension only, glob-like)
+    def filter_for_compatible_extensions(fnames):
+        if not ignore_exts:
+            return fnames
+        # only attention is on extension
+        filtered = [f for f in fnames if f.split(".")[-1] not in ignore_exts]
+        return filtered
+
+    # Helper: filter filenames by compiled regex (operates only on the basename part)
+    def filter_with_regex(fnames, pattern_re):
+        return {f for f in fnames if pattern_re.match(f.split("/")[-1])}
 
     usable_filenames = set()
     variant_filenames = set()
-    for component, component_filenames in components.items():
-        component_filenames = filter_for_compatible_extensions(component_filenames, ignore_patterns=ignore_patterns)
+    for component, comp_filenames in components.items():
+        comp_filenames = filter_for_compatible_extensions(comp_filenames)
 
-        component_variants = set()
-        component_legacy_variants = set()
-        component_non_variants = set()
         if variant is not None:
-            component_variants = filter_with_regex(component_filenames, variant_file_re)
-            component_variant_index_files = filter_with_regex(component_filenames, variant_index_re)
-
-            component_legacy_variants = filter_with_regex(component_filenames, legacy_variant_file_re)
-            component_legacy_variant_index_files = filter_with_regex(component_filenames, legacy_variant_index_re)
+            component_variants = filter_with_regex(comp_filenames, variant_file_re)
+            component_variant_index_files = filter_with_regex(comp_filenames, variant_index_re)
+            component_legacy_variants = filter_with_regex(comp_filenames, legacy_variant_file_re)
+            component_legacy_variant_index_files = filter_with_regex(comp_filenames, legacy_variant_index_re)
+        else:
+            component_variants = component_variant_index_files = component_legacy_variants = component_legacy_variant_index_files = set()
 
         if component_variants or component_legacy_variants:
-            variant_filenames.update(
-                component_variants | component_variant_index_files
-                if component_variants
-                else component_legacy_variants | component_legacy_variant_index_files
-            )
-
+            # prefer true variants, fall back to legacy if needed
+            if component_variants:
+                variant_filenames.update(component_variants)
+                variant_filenames.update(component_variant_index_files)
+            else:
+                variant_filenames.update(component_legacy_variants)
+                variant_filenames.update(component_legacy_variant_index_files)
         else:
-            component_non_variants = filter_with_regex(component_filenames, non_variant_file_re)
-            component_variant_index_files = filter_with_regex(component_filenames, non_variant_index_re)
-
-            usable_filenames.update(component_non_variants | component_variant_index_files)
+            # non-variant handling (default)
+            component_non_variants = filter_with_regex(comp_filenames, non_variant_file_re)
+            component_variant_index_files = filter_with_regex(comp_filenames, non_variant_index_re)
+            usable_filenames.update(component_non_variants)
+            usable_filenames.update(component_variant_index_files)
 
     usable_filenames.update(variant_filenames)
 
-    if len(variant_filenames) == 0 and variant is not None:
-        error_message = f"You are trying to load model files of the `variant={variant}`, but no such modeling files are available. "
-        raise ValueError(error_message)
+    if variant is not None and not variant_filenames:
+        # Early exit if missing variant files
+        raise ValueError(f"You are trying to load model files of the `variant={variant}`, but no such modeling files are available. ")
 
-    if len(variant_filenames) > 0 and usable_filenames != variant_filenames:
+    if variant_filenames and usable_filenames != variant_filenames:
         logger.warning(
             f"\nA mixture of {variant} and non-{variant} filenames will be loaded.\nLoaded {variant} filenames:\n"
             f"[{', '.join(variant_filenames)}]\nLoaded non-{variant} filenames:\n"
