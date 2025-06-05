@@ -244,7 +244,9 @@ class LCMScheduler(SchedulerMixin, ConfigMixin):
 
         # setable values
         self.num_inference_steps = None
-        self.timesteps = torch.from_numpy(np.arange(0, num_train_timesteps)[::-1].copy().astype(np.int64))
+
+        # Use torch.arange directly, reverse with descending step, dtype int64 for safety
+        self.timesteps = torch.arange(num_train_timesteps - 1, -1, -1, dtype=torch.int64)
         self.custom_timesteps = False
 
         self._step_index = None
@@ -600,22 +602,27 @@ class LCMScheduler(SchedulerMixin, ConfigMixin):
         # Make sure alphas_cumprod and timestep have same device and dtype as original_samples
         # Move the self.alphas_cumprod to device to avoid redundant CPU to GPU data movement
         # for the subsequent add_noise calls
-        self.alphas_cumprod = self.alphas_cumprod.to(device=original_samples.device)
-        alphas_cumprod = self.alphas_cumprod.to(dtype=original_samples.dtype)
-        timesteps = timesteps.to(original_samples.device)
+        # Use local variable for device/dtype so we avoid repeated to() calls and re-copy
+        device = original_samples.device
+        dtype = original_samples.dtype
+        ac = self.alphas_cumprod
+        # Only move to device if not already there
+        if ac.device != device:
+            ac = ac.to(device=device, non_blocking=True)
+        ac = ac.to(dtype=dtype)
+        timesteps = timesteps.to(device)
 
-        sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
-        sqrt_alpha_prod = sqrt_alpha_prod.flatten()
-        while len(sqrt_alpha_prod.shape) < len(original_samples.shape):
-            sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
+        # Index will be 1D, shape (N,)
+        # Compute broadcastable shapes for original_samples
+        sqrt_alpha_prod = torch.sqrt(ac[timesteps])
+        sqrt_one_minus_alpha_prod = torch.sqrt(1 - ac[timesteps])
 
-        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
-        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
-        while len(sqrt_one_minus_alpha_prod.shape) < len(original_samples.shape):
-            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+        # Efficient broadcasting to match original_samples shape
+        shape = original_samples.shape
+        sqrt_alpha_prod = sqrt_alpha_prod.view([-1] + [1]*(len(shape)-1))
+        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.view([-1] + [1]*(len(shape)-1))
 
-        noisy_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
-        return noisy_samples
+        return sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
 
     # Copied from diffusers.schedulers.scheduling_ddpm.DDPMScheduler.get_velocity
     def get_velocity(self, sample: torch.Tensor, noise: torch.Tensor, timesteps: torch.IntTensor) -> torch.Tensor:
