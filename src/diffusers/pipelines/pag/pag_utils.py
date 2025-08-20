@@ -142,12 +142,12 @@ class PAGMixin:
         Returns:
             torch.Tensor: The prepared perturbed attention guidance tensor.
         """
-
-        cond = torch.cat([cond] * 2, dim=0)
-
         if do_classifier_free_guidance:
-            cond = torch.cat([uncond, cond], dim=0)
-        return cond
+            # Concatenate uncond once, cond twice efficiently
+            return torch.cat((uncond, cond, cond), dim=0)
+        else:
+            # Only duplicate cond efficiently
+            return torch.cat((cond, cond), dim=0)
 
     def set_pag_applied_layers(
         self,
