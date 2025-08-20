@@ -34,7 +34,7 @@ from . import BaseDiffusersCLICommand
 
 
 def info_command_factory(_):
-    return EnvironmentCommand()
+    return _env_cmd_instance
 
 
 class EnvironmentCommand(BaseDiffusersCLICommand):
@@ -178,3 +178,5 @@ class EnvironmentCommand(BaseDiffusersCLICommand):
     @staticmethod
     def format_dict(d: dict) -> str:
         return "\n".join([f"- {prop}: {val}" for prop, val in d.items()]) + "\n"
+
+_env_cmd_instance = EnvironmentCommand()
