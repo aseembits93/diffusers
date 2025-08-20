@@ -1335,6 +1335,10 @@ class Expectations(DevicePropertiesUserDict):
 
     @staticmethod
     def is_default(key: DeviceProperties) -> bool:
+        # Optimized for the expected length-2 tuple
+        if len(key) == 2:
+            return key[0] is None and key[1] is None
+        # Fallback for other sizes (shouldn't occur per type definition)
         return all(p is None for p in key)
 
     @staticmethod
